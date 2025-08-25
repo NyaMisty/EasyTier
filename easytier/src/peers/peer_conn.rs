@@ -172,7 +172,7 @@ impl PeerConn {
 
             ctrl_resp_sender: ctrl_sender,
 
-            latency_stats: Arc::new(WindowLatency::new(15)),
+            latency_stats: Arc::new(WindowLatency::new(5)),
             throughput,
             loss_rate_stats: Arc::new(AtomicU32::new(0)),
 
