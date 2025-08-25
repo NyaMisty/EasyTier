@@ -141,42 +141,79 @@ impl Peer {
             .issue_event(GlobalCtxEvent::PeerConnAdded(conn_info));
     }
 
+    async fn _do_select_conn(&self, filter_old: bool, prefer_tcp: bool) -> Option<PeerConnId> {
+        let mut ret_conn_id: Option<PeerConnId> = None;
+        let mut ret_conn_info: PeerConnInfo = PeerConnInfo::default();
+        
+        let mut tcp_conn_id: Option<PeerConnId> = None;
+        let mut tcp_conn_info: PeerConnInfo = PeerConnInfo::default();
+
+        
+        // find a conn with the smallest latency
+        let mut min_latency = u64::MAX;
+        let mut min_tcp_latency = u64::MAX;
+        for conn in self.conns.iter() {
+            let conn_info = conn.value().get_conn_info();
+            let stats = match conn_info.stats.as_ref() { Some(s) => s, None => continue };
+            const MAX_CONN_AGE: u64 = 1500; // 1.5s
+            if filter_old && stats.last_response_age_ms > MAX_CONN_AGE { continue; }
+
+            let latency = stats.latency_us;
+            let tunnel_type = match conn_info.tunnel.as_ref() {
+                Some(t) => t.tunnel_type.as_str(),
+                None => "unknown",
+            };
+            if tunnel_type == "tcp" {
+                if latency < min_tcp_latency {
+                    min_tcp_latency = latency;
+                    tcp_conn_id = Some(conn.get_conn_id());
+                    tcp_conn_info = conn_info.clone();
+                }
+            }
+            if latency < min_latency {
+                min_latency = latency;
+                ret_conn_id = Some(conn.get_conn_id());
+                ret_conn_info = conn_info;
+            }
+        }
+
+        if let Some(ret_conn_id) = ret_conn_id {
+            if let Some(tcp_conn_id) = tcp_conn_id {
+                if prefer_tcp && (min_latency as i64 - min_tcp_latency as i64).abs() < 50*100 { // latency diff < 50ms
+                    tracing::debug!("peer {} selected preferred tcp conn {}: {:?}", self.peer_node_id, tcp_conn_info.peer_id, tcp_conn_info.tunnel);
+                    Some(tcp_conn_id)
+                } else {
+                    tracing::debug!("peer {} selected non-tcp conn {}: {:?}", self.peer_node_id, ret_conn_info.peer_id, ret_conn_info.tunnel);
+                    Some(ret_conn_id)
+                }
+            } else {
+                tracing::debug!("peer {} selected min latency conn {}: {:?}", self.peer_node_id, ret_conn_info.peer_id, ret_conn_info.tunnel);
+                Some(ret_conn_id)
+            }
+        } else {
+            None
+        }
+    }
+
     async fn select_conn(&self) -> Option<ArcPeerConn> {
         let default_conn_id = self.default_conn_id.load();
         if let Some(conn) = self.conns.get(&default_conn_id) {
             return Some(conn.clone());
         }
 
-        // find fresh conn
-        const MAX_CONN_AGE: u64 = 1500; // 1.5s
-        let mut found: bool = false;
-        for conn in self.conns.iter() {
-            let last_response_age_ms = conn.value().get_stats().last_response_age_ms;
-            if last_response_age_ms < MAX_CONN_AGE {
-                // find a conn with the smallest latency
-                let mut min_latency = u64::MAX;
-                for conn in self.conns.iter() {
-                    let latency = conn.value().get_stats().latency_us;
-                    if latency < min_latency {
-                        min_latency = latency;
-                        self.default_conn_id.store(conn.get_conn_id());
-                        tracing::info!("peer {} selected close event listener exit", self.peer_node_id);
-                        found = true;
-                    }
-                }
-            }
-        }
-        if !found {
+        if let Some(conn_id) = self._do_select_conn(true, true).await {
+            self.default_conn_id.store(conn_id)
+        } else {
             // all conn are old and timeout, select a most fresh one
             let mut min_age = u64::MAX;
-                for conn in self.conns.iter() {
-                    let age = conn.value().get_stats().last_response_age_ms;
-                    if age < min_age {
-                        min_age = age;
-                        self.default_conn_id.store(conn.get_conn_id());
-                        // found = true;
-                    }
+            for conn in self.conns.iter() {
+                let age = conn.value().get_stats().last_response_age_ms;
+                if age < min_age {
+                    min_age = age;
+                    self.default_conn_id.store(conn.get_conn_id());
                 }
+            }
+            tracing::debug!("peer {} has no healthy conn, selecting recent conn {}", self.peer_node_id, self.default_conn_id.load());
         }
 
         self.conns
