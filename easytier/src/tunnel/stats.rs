@@ -1,10 +1,12 @@
+use core::sync::atomic::AtomicU64;
 use std::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicU32, Ordering::Relaxed},
+    sync::atomic::{AtomicU32, Ordering::Relaxed}, time::Instant,
 };
 
 pub struct WindowLatency {
     latency_us_window: Vec<AtomicU32>,
+    latency_us_window_ts: Vec<AtomicU64>,
     latency_us_window_index: AtomicU32,
     latency_us_window_size: u32,
 
@@ -26,6 +28,7 @@ impl WindowLatency {
     pub fn new(window_size: u32) -> Self {
         Self {
             latency_us_window: (0..window_size).map(|_| AtomicU32::new(0)).collect(),
+            latency_us_window_ts: (0..window_size).map(|_| AtomicU64::new(0)).collect(),
             latency_us_window_index: AtomicU32::new(0),
             latency_us_window_size: window_size,
 
@@ -42,6 +45,7 @@ impl WindowLatency {
 
         let index = index % self.latency_us_window_size;
         let old_lat = self.latency_us_window[index as usize].swap(latency_us, Relaxed);
+        self.latency_us_window_ts[index as usize].swap(Instant::now().elapsed().as_millis() as u64, Relaxed);
 
         if old_lat < latency_us {
             self.sum.fetch_add(latency_us - old_lat, Relaxed);
@@ -58,6 +62,13 @@ impl WindowLatency {
         } else {
             (T::from(sum)) / T::from(count)
         }
+    }
+
+    pub fn get_last_response_age_ms<T: From<u32> + std::ops::Div<Output = T>>(&self) -> T {
+        let index = self.latency_us_window_index.load(Relaxed) % self.latency_us_window_size;
+        let last_ts = self.latency_us_window_ts[index as usize].load(Relaxed);
+        let since_last_ts = Instant::now().elapsed().as_millis() as u64 - last_ts;
+        T::from(since_last_ts.try_into().unwrap())
     }
 }
 

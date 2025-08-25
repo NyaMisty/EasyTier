@@ -19,6 +19,9 @@ message PeerConnStats {
   uint64 tx_packets = 4;
 
   uint64 latency_us = 5;
+
+  uint64 last_response_age_ms = 6;
+  float loss_rate = 7;
 }
 
 message PeerConnInfo {

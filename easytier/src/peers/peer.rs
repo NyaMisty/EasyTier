@@ -96,7 +96,7 @@ impl Peer {
         let default_conn_id_copy = default_conn_id.clone();
         let default_conn_id_clear_task = ScopedTask::from(tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 if conns_copy.len() > 1 {
                     default_conn_id_copy.store(PeerConnId::default());
                 }
@@ -147,14 +147,36 @@ impl Peer {
             return Some(conn.clone());
         }
 
-        // find a conn with the smallest latency
-        let mut min_latency = u64::MAX;
+        // find fresh conn
+        const MAX_CONN_AGE: u64 = 1500; // 1.5s
+        let mut found: bool = false;
         for conn in self.conns.iter() {
-            let latency = conn.value().get_stats().latency_us;
-            if latency < min_latency {
-                min_latency = latency;
-                self.default_conn_id.store(conn.get_conn_id());
+            let last_response_age_ms = conn.value().get_stats().last_response_age_ms;
+            if last_response_age_ms < MAX_CONN_AGE {
+                // find a conn with the smallest latency
+                let mut min_latency = u64::MAX;
+                for conn in self.conns.iter() {
+                    let latency = conn.value().get_stats().latency_us;
+                    if latency < min_latency {
+                        min_latency = latency;
+                        self.default_conn_id.store(conn.get_conn_id());
+                        tracing::info!("peer {} selected close event listener exit", self.peer_node_id);
+                        found = true;
+                    }
+                }
             }
+        }
+        if !found {
+            // all conn are old and timeout, select a most fresh one
+            let mut min_age = u64::MAX;
+                for conn in self.conns.iter() {
+                    let age = conn.value().get_stats().last_response_age_ms;
+                    if age < min_age {
+                        min_age = age;
+                        self.default_conn_id.store(conn.get_conn_id());
+                        // found = true;
+                    }
+                }
         }
 
         self.conns
