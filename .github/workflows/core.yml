@@ -23,7 +23,11 @@ jobs:
       # do not skip push on branch starts with releases/
       should_skip: ${{ steps.skip_check.outputs.should_skip == 'true' && !startsWith(github.ref_name, 'releases/') }}
     steps:
+      - id: stub
+        run: |
+          echo stub
       - id: skip_check
+        if: false
         uses: fkirc/skip-duplicate-actions@v5
         with:
           # All of these options are optional, so you can remove them if you are happy with the defaults
