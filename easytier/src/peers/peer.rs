@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crossbeam::atomic::AtomicCell;
+use arc_swap::ArcSwap;
 use dashmap::{DashMap, DashSet};
 
 use tokio::{select, sync::mpsc};
@@ -36,7 +36,7 @@ pub struct Peer {
 
     shutdown_notifier: Arc<tokio::sync::Notify>,
 
-    default_conn_id: Arc<AtomicCell<PeerConnId>>,
+    default_conn_ids: Arc<ArcSwap<Vec<PeerConnId>>>,
     default_conn_id_clear_task: ScopedTask<()>,
 }
 
@@ -90,15 +90,15 @@ impl Peer {
         )
         .into();
 
-        let default_conn_id = Arc::new(AtomicCell::new(PeerConnId::default()));
+        let default_conn_ids = Arc::new(ArcSwap::from_pointee(Vec::new()));
 
         let conns_copy = conns.clone();
-        let default_conn_id_copy = default_conn_id.clone();
+        let default_conn_ids_copy = default_conn_ids.clone();
         let default_conn_id_clear_task = ScopedTask::from(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 if conns_copy.len() > 1 {
-                    default_conn_id_copy.store(PeerConnId::default());
+                    default_conn_ids_copy.store(Arc::new(vec![PeerConnId::default()]));
                 }
             }
         }));
@@ -113,7 +113,7 @@ impl Peer {
             close_event_listener,
 
             shutdown_notifier,
-            default_conn_id,
+            default_conn_ids,
             default_conn_id_clear_task,
         }
     }
@@ -141,91 +141,164 @@ impl Peer {
             .issue_event(GlobalCtxEvent::PeerConnAdded(conn_info));
     }
 
-    async fn _do_select_conn(&self, filter_old: bool, prefer_tcp: bool) -> Option<PeerConnId> {
-        let mut ret_conn_id: Option<PeerConnId> = None;
-        let mut ret_conn_info: PeerConnInfo = PeerConnInfo::default();
-        
-        let mut tcp_conn_id: Option<PeerConnId> = None;
-        let mut tcp_conn_info: PeerConnInfo = PeerConnInfo::default();
+    const MAX_CONN_AGE_MS: u64 = 800; // 800ms
+    // const MAX_CONN_AGE_MS: u64 = 1_500;           // 1.5s
+    const TCP_PREFERENCE_DELTA_US: u64 = 50_000;  // 50ms (微秒)
 
-        
-        // find a conn with the smallest latency
-        let mut min_latency = u64::MAX;
-        let mut min_tcp_latency = u64::MAX;
+    async fn _do_select_conn(&self, filter_old: bool, prefer_tcp: bool) -> Vec<PeerConnId> {
+
+        #[derive(Clone)]
+        struct Cand {
+            id: PeerConnId,
+            latency_us: u64,
+            is_tcp: bool,
+            conn_info: PeerConnInfo,
+        }
+
+        let mut cands: Vec<Cand> = Vec::new();
+
+        // 单次遍历收集候选，避免不必要的 clone
         for conn in self.conns.iter() {
-            let conn_info = conn.value().get_conn_info();
-            let stats = match conn_info.stats.as_ref() { Some(s) => s, None => continue };
-            const MAX_CONN_AGE: u64 = 1500; // 1.5s
-            if filter_old && stats.last_response_age_ms > MAX_CONN_AGE { continue; }
-
-            let latency = stats.latency_us;
-            let tunnel_type = match conn_info.tunnel.as_ref() {
-                Some(t) => t.tunnel_type.as_str(),
-                None => "unknown",
+            let info = conn.value().get_conn_info();
+            let stats = match info.stats.as_ref() {
+                Some(s) => s,
+                None => continue,
             };
-            if tunnel_type == "tcp" {
-                if latency < min_tcp_latency {
-                    min_tcp_latency = latency;
-                    tcp_conn_id = Some(conn.get_conn_id());
-                    tcp_conn_info = conn_info.clone();
-                }
+            if filter_old && stats.last_response_age_ms > Peer::MAX_CONN_AGE_MS {
+                continue;
             }
-            if latency < min_latency {
-                min_latency = latency;
-                ret_conn_id = Some(conn.get_conn_id());
-                ret_conn_info = conn_info;
+
+            let is_tcp = match info.tunnel.as_ref() {
+                Some(t) => t.tunnel_type.as_str() == "tcp",
+                None => false,
+            };
+
+            cands.push(Cand {
+                id: conn.get_conn_id(),
+                latency_us: stats.latency_us,
+                is_tcp,
+                conn_info: info,
+            });
+        }
+
+        if cands.is_empty() {
+            return Vec::new();
+        }
+
+        // 先按延迟升序排序，得到全局最优在 index 0
+        cands.sort_by_key(|c| c.latency_us);
+
+        let best_overall_latency = cands[0].latency_us;
+
+        // 找到最优 TCP（如果有）
+        let best_tcp_idx_and_latency = cands
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.is_tcp)
+            .min_by_key(|(_, c)| c.latency_us)
+            .map(|(i, c)| (i, c.latency_us));
+
+        // 确定置顶元素（primary）
+        let mut primary_idx = 0usize;
+        if prefer_tcp {
+            if let Some((tcp_idx, best_tcp_latency)) = best_tcp_idx_and_latency {
+                let diff = if best_overall_latency > best_tcp_latency {
+                    best_overall_latency - best_tcp_latency
+                } else {
+                    best_tcp_latency - best_overall_latency
+                };
+                if diff < Peer::TCP_PREFERENCE_DELTA_US {
+                    primary_idx = tcp_idx;
+                }
             }
         }
 
-        if let Some(ret_conn_id) = ret_conn_id {
-            if let Some(tcp_conn_id) = tcp_conn_id {
-                if prefer_tcp && (min_latency as i64 - min_tcp_latency as i64).abs() < 50*100 { // latency diff < 50ms
-                    tracing::debug!("peer {} selected preferred tcp conn {}: {:?}", self.peer_node_id, tcp_conn_info.peer_id, tcp_conn_info.tunnel);
-                    Some(tcp_conn_id)
-                } else {
-                    tracing::debug!("peer {} selected non-tcp conn {}: {:?}", self.peer_node_id, ret_conn_info.peer_id, ret_conn_info.tunnel);
-                    Some(ret_conn_id)
-                }
-            } else {
-                tracing::debug!("peer {} selected min latency conn {}: {:?}", self.peer_node_id, ret_conn_info.peer_id, ret_conn_info.tunnel);
-                Some(ret_conn_id)
-            }
-        } else {
-            None
+        // 生成返回列表：把 primary 移到最前，其余保持延迟升序
+        let total_candidates = cands.len();
+        let primary_info = cands[primary_idx].conn_info.clone();
+        let mut out: Vec<PeerConnId> = cands.into_iter().map(|c| c.id).collect();
+        if primary_idx != 0 {
+            let chosen = out.remove(primary_idx);
+            out.insert(0, chosen);
         }
+
+        // 精简日志，避免使用已移动的数据
+        tracing::debug!(
+            "peer {} selected primary conn (tcp_pref={}, total_candidates={}): {:?}",
+            self.peer_node_id,
+            prefer_tcp,
+            total_candidates,
+            primary_info,
+        );
+
+        out
     }
 
-    async fn select_conn(&self) -> Option<ArcPeerConn> {
-        let default_conn_id = self.default_conn_id.load();
-        if let Some(conn) = self.conns.get(&default_conn_id) {
-            return Some(conn.clone());
+    async fn _do_select_conn_recent(&self) -> Vec<PeerConnId> {
+        let mut conn_infos: Vec<(PeerConnId, PeerConnInfo)> = vec![];
+        for conn in self.conns.iter() {
+            let conn_info = conn.value().get_conn_info();
+            // let stats = match conn_info.stats.as_ref() { Some(s) => s, None => continue };
+            // if stats.last_response_age_ms > Peer::MAX_CONN_AGE_MS { continue; }
+            conn_infos.push((conn.get_conn_id(), conn_info));
         }
+        // sort by last_response_age_ms
+        conn_infos.sort_by_key(|(_, info)| info.stats.as_ref().map_or(u64::MAX, |s| s.last_response_age_ms));
+        conn_infos.into_iter().map(|(id, _)| id).collect()
+    }
 
-        if let Some(conn_id) = self._do_select_conn(true, true).await {
-            self.default_conn_id.store(conn_id)
-        } else {
-            // all conn are old and timeout, select a most fresh one
-            let mut min_age = u64::MAX;
-            for conn in self.conns.iter() {
-                let age = conn.value().get_stats().last_response_age_ms;
-                if age < min_age {
-                    min_age = age;
-                    self.default_conn_id.store(conn.get_conn_id());
+    async fn select_conns(&self) -> Vec<ArcPeerConn> {
+        let default_conn_ids = self.default_conn_ids.load();
+        if !default_conn_ids.is_empty() {
+            let mut conns = vec![];
+            for conn_id in default_conn_ids.iter() {
+                if let Some(conn) = self.conns.get(conn_id) {
+                    conns.push(conn.clone());
                 }
             }
-            tracing::debug!("peer {} has no healthy conn, selecting recent conn {}", self.peer_node_id, self.default_conn_id.load());
+            if !conns.is_empty() {
+                return conns;
+            }
         }
 
-        self.conns
-            .get(&self.default_conn_id.load())
-            .map(|conn| conn.clone())
+        let conn_ids = self._do_select_conn(true, true).await;
+        if !conn_ids.is_empty() {
+            self.default_conn_ids.store(Arc::new(conn_ids.iter().take(1).cloned().collect()));
+        } else {
+            let conn_ids = self._do_select_conn_recent().await;
+            tracing::warn!("peer {} has no healthy conn, selecting 3 most recent conns!", self.peer_node_id);
+            self.default_conn_ids.store(Arc::new(conn_ids.iter().take(3).cloned().collect()));
+        }
+
+        let mut conns = vec![];
+        let default_conn_ids = self.default_conn_ids.load();
+        for conn_id in default_conn_ids.iter() {
+            if let Some(conn) = self.conns.get(conn_id) {
+                conns.push(conn.clone());
+            }
+        }
+        conns
     }
 
     pub async fn send_msg(&self, msg: ZCPacket) -> Result<(), Error> {
-        let Some(conn) = self.select_conn().await else {
+        let conns = self.select_conns().await;
+        if conns.is_empty() {
             return Err(Error::PeerNoConnectionError(self.peer_node_id));
         };
-        conn.send_msg(msg).await?;
+        // parallel send
+        let mut send_futures = vec![];
+        let msg = Arc::new(msg);
+        for conn in conns.iter() {
+            let conn = conn.clone();
+            let msg = Arc::clone(&msg);
+            send_futures.push(tokio::spawn(async move {
+                if let Err(e) = conn.send_msg((*msg).clone()).await {
+                    tracing::warn!(?e, ?conn, "failed to send msg to peer");
+                }
+            }));
+        }
+        // wait for all send finish
+        let _ = futures::future::join_all(send_futures).await;
 
         Ok(())
     }
@@ -274,7 +347,12 @@ impl Peer {
     }
 
     pub fn get_default_conn_id(&self) -> PeerConnId {
-        self.default_conn_id.load()
+        let conn_ids = self.default_conn_ids.load();
+        if !conn_ids.is_empty() {
+            conn_ids[0]
+        } else {
+            PeerConnId::default()
+        }
     }
 }
 
