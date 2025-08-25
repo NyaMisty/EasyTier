@@ -285,21 +285,43 @@ impl Peer {
         if conns.is_empty() {
             return Err(Error::PeerNoConnectionError(self.peer_node_id));
         };
-        // parallel send
+        if conns.len() == 1 {
+            let conn = conns[0].clone();
+            conn.send_msg(msg).await?;
+            return Ok(());
+        }
+        tracing::debug!(
+            ?self.peer_node_id,
+            conn_count = conns.len(),
+            "sending msg to multiple conns",
+        );
+        // parallel send, collect results
         let mut send_futures = vec![];
-        let msg = Arc::new(msg);
         for conn in conns.iter() {
             let conn = conn.clone();
-            let msg = Arc::clone(&msg);
+            let msg = msg.clone();
             send_futures.push(tokio::spawn(async move {
-                if let Err(e) = conn.send_msg((*msg).clone()).await {
-                    tracing::warn!(?e, ?conn, "failed to send msg to peer");
+                if let Err(e) = conn.send_msg(msg).await {
+                    tracing::warn!(?e, ?conn, "failed to send msg to peer"); 
+                    return Err(e);
                 }
+                Ok(())
             }));
         }
         // wait for all send finish
-        let _ = futures::future::join_all(send_futures).await;
+        let results = futures::future::join_all(send_futures).await;
 
+        // Check if all failed
+        let mut all_failed = true;
+        for res in results {
+            if let Ok(Ok(_)) = res {
+                all_failed = false;
+                break;
+            }
+        }
+        if all_failed {
+            return Err(Error::PeerNoConnectionError(self.peer_node_id));
+        }
         Ok(())
     }
 
