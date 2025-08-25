@@ -95,6 +95,7 @@ impl PingIntervalController {
             // if the conn is in use, we should do pingpong more frequently
             self.backoff_idx = 0;
         }
+        self.backoff_idx = 0;
 
         self.last_throughput = (*self.throughput).clone();
 
