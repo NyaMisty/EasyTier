@@ -87,8 +87,12 @@ impl PingIntervalController {
     fn should_send_ping(&mut self) -> bool {
         if self.loss_counter.load(Ordering::Relaxed) > 0 {
             self.backoff_idx = 0;
-        } else if self.tx_increase() && !self.rx_increase() {
-            // if tx increase but rx not increase, we should do pingpong more frequently
+        // } else if self.tx_increase() && !self.rx_increase() {
+        //     // if tx increase but rx not increase, we should do pingpong more frequently
+        //     self.backoff_idx = 0;
+        // }
+        } else if self.tx_increase() || self.rx_increase() {
+            // if the conn is in use, we should do pingpong more frequently
             self.backoff_idx = 0;
         }
 
@@ -302,7 +306,7 @@ impl PeerConnPinger {
 
             let loss_rate_1: f64 = loss_rate_stats_1.get_latency_us();
 
-            tracing::trace!(
+            tracing::debug!(
                 ?ret,
                 ?self,
                 ?loss_rate_1,
