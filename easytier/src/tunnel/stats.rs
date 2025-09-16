@@ -1,4 +1,4 @@
-use core::sync::atomic::AtomicU64;
+use atomic_shim::AtomicU64;
 use std::{
     cell::UnsafeCell,
     sync::atomic::{AtomicU32, Ordering::Relaxed}, time::Instant,
