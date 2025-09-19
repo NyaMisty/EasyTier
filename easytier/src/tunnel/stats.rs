@@ -64,7 +64,7 @@ impl WindowLatency {
         }
     }
 
-    pub fn get_last_response_age_ms<T: From<u32> + std::ops::Div<Output = T>>(&self) -> T {
+    pub fn get_last_response_age_ms<T: From<u64> + std::ops::Div<Output = T>>(&self) -> T {
         let index = self.latency_us_window_index.load(Relaxed) % self.latency_us_window_size;
         let last_ts = self.latency_us_window_ts[index as usize].load(Relaxed);
         let since_last_ts = Instant::now().elapsed().as_millis() as u64 - last_ts;
