@@ -295,34 +295,29 @@ impl Peer {
             conn_count = conns.len(),
             "sending msg to multiple conns",
         );
-        // parallel send, collect results
-        let mut send_futures = vec![];
+        // 并发发送，任意一个成功即返回，不等待其他 future
+        use futures::StreamExt;
+        let mut futs = futures::stream::FuturesUnordered::new();
         for conn in conns.iter() {
             let conn = conn.clone();
-            let msg = msg.clone();
-            send_futures.push(tokio::spawn(async move {
-                if let Err(e) = conn.send_msg(msg).await {
-                    tracing::warn!(?e, ?conn, "failed to send msg to peer"); 
-                    return Err(e);
-                }
-                Ok(())
-            }));
+            let conn_id = conn.get_conn_id();
+            let packet = msg.clone();
+            futs.push(async move { (conn_id, conn.send_msg(packet).await) });
         }
-        // wait for all send finish
-        let results = futures::future::join_all(send_futures).await;
 
-        // Check if all failed
-        let mut all_failed = true;
-        for res in results {
-            if let Ok(Ok(_)) = res {
-                all_failed = false;
-                break;
+        while let Some((conn_id, res)) = futs.next().await {
+            match res {
+                Ok(()) => {
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!(?e, ?conn_id, "failed to send msg to peer");
+                }
             }
         }
-        if all_failed {
-            return Err(Error::PeerNoConnectionError(self.peer_node_id));
-        }
-        Ok(())
+
+        // 全部失败
+        Err(Error::PeerNoConnectionError(self.peer_node_id))
     }
 
     pub async fn close_peer_conn(&self, conn_id: &PeerConnId) -> Result<(), Error> {
