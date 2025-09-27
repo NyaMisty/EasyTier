@@ -15,6 +15,7 @@ use anyhow::Context;
 use quinn::{
     congestion::BbrConfig, crypto::rustls::QuicClientConfig, udp::RecvMeta, AsyncUdpSocket,
     ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig, TransportConfig, UdpPoller,
+    VarInt,
 };
 
 use super::{
@@ -29,7 +30,13 @@ pub fn configure_client() -> ClientConfig {
 
     // // Create a new TransportConfig and set BBR
     let mut transport_config = TransportConfig::default();
-    transport_config.congestion_controller_factory(Arc::new(BbrConfig::default()));
+    
+    let mut bbr_config = BbrConfig::default();
+    bbr_config.initial_window(10 * 1024 * 1024);
+    transport_config.congestion_controller_factory(Arc::new(bbr_config));
+    transport_config.receive_window(VarInt::from_u32(32 * 1024 * 1024));
+    transport_config.send_window(32 * 1024 * 1024);
+    transport_config.stream_receive_window(VarInt::from_u32(8 * 1024 * 1024));
     transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
     // Replace the default TransportConfig with the transport_config() method
     client_config.transport_config(Arc::new(transport_config));
@@ -115,7 +122,12 @@ pub fn configure_server() -> Result<(ServerConfig, Vec<u8>), Box<dyn Error>> {
     transport_config.max_concurrent_uni_streams(10_u8.into());
     transport_config.max_concurrent_bidi_streams(10_u8.into());
     // Setting BBR congestion control
-    transport_config.congestion_controller_factory(Arc::new(BbrConfig::default()));
+    let mut bbr_config = BbrConfig::default();
+    bbr_config.initial_window(10 * 1024 * 1024);
+    transport_config.congestion_controller_factory(Arc::new(bbr_config));
+    transport_config.receive_window(VarInt::from_u32(32 * 1024 * 1024));
+    transport_config.send_window(32 * 1024 * 1024);
+    transport_config.stream_receive_window(VarInt::from_u32(8 * 1024 * 1024));
 
     Ok((server_config, certs[0].to_vec()))
 }
