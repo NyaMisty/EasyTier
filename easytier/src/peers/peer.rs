@@ -147,7 +147,7 @@ impl Peer {
 
     async fn _do_select_conn(&self, filter_old: bool, prefer_tcp: bool) -> Vec<PeerConnId> {
 
-        #[derive(Clone)]
+        #[derive(Clone, Debug)]
         struct Cand {
             id: PeerConnId,
             latency_us: u64,
@@ -180,6 +180,16 @@ impl Peer {
                 conn_info: info,
             });
         }
+
+        tracing::debug!(
+            ?self.peer_node_id,
+            filter_old,
+            prefer_tcp,
+            conn_count = self.conns.len(),
+            "selecting peer conns from: {:?}",
+            cands,
+        );
+
 
         if cands.is_empty() {
             return Vec::new();
@@ -285,16 +295,16 @@ impl Peer {
         if conns.is_empty() {
             return Err(Error::PeerNoConnectionError(self.peer_node_id));
         };
+        tracing::debug!(
+            ?self.peer_node_id,
+            conn_count = conns.len(),
+            "sending msg to conns: {:?}", conns
+        );
         if conns.len() == 1 {
             let conn = conns[0].clone();
             conn.send_msg(msg).await?;
             return Ok(());
         }
-        tracing::debug!(
-            ?self.peer_node_id,
-            conn_count = conns.len(),
-            "sending msg to multiple conns",
-        );
         // 并发发送，任意一个成功即返回，不等待其他 future
         use futures::StreamExt;
         let mut futs = futures::stream::FuturesUnordered::new();
