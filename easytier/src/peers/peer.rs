@@ -37,7 +37,10 @@ pub struct Peer {
     shutdown_notifier: Arc<tokio::sync::Notify>,
 
     default_conn_ids: Arc<ArcSwap<Vec<PeerConnId>>>,
-    default_conn_id_clear_task: ScopedTask<()>,
+    // 新增：控制选择更新的互斥和通知，替换原清理任务
+    select_update_mutex: Arc<tokio::sync::Mutex<()>>, // 保证同一时间只有一个更新任务在运行
+    select_update_notify: Arc<tokio::sync::Notify>,    // 通知等待者更新已完成
+    default_conn_refresh_task: ScopedTask<()>,         // 200ms 周期刷新任务
 }
 
 impl Peer {
@@ -50,9 +53,18 @@ impl Peer {
         let (close_event_sender, mut close_event_receiver) = mpsc::channel(10);
         let shutdown_notifier = Arc::new(tokio::sync::Notify::new());
 
+        // 初始化新的并发控制与周期刷新机制（提前创建，供后续监听器使用）
+        let default_conn_ids = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let select_update_mutex = Arc::new(tokio::sync::Mutex::new(()));
+        let select_update_notify = Arc::new(tokio::sync::Notify::new());
+
+        // 关闭事件监听器（在移除连接时触发一次刷新）
         let conns_copy = conns.clone();
         let shutdown_notifier_copy = shutdown_notifier.clone();
         let global_ctx_copy = global_ctx.clone();
+        let default_conn_ids_copy_for_close = default_conn_ids.clone();
+        let select_update_mutex_copy_for_close = select_update_mutex.clone();
+        let select_update_notify_copy_for_close = select_update_notify.clone();
         let close_event_listener = tokio::spawn(
             async move {
                 loop {
@@ -72,6 +84,21 @@ impl Peer {
                                 global_ctx_copy.issue_event(GlobalCtxEvent::PeerConnRemoved(
                                     conn.get_conn_info(),
                                 ));
+                                // 触发一次立即刷新（不阻塞监听器）
+                                let conns_for_task = conns_copy.clone();
+                                let default_ids_for_task = default_conn_ids_copy_for_close.clone();
+                                let mutex_for_task = select_update_mutex_copy_for_close.clone();
+                                let notify_for_task = select_update_notify_copy_for_close.clone();
+                                tokio::spawn(async move {
+                                    Peer::refresh_default_conn_ids_with_delay(
+                                        peer_node_id,
+                                        conns_for_task,
+                                        default_ids_for_task,
+                                        mutex_for_task,
+                                        notify_for_task,
+                                        std::time::Duration::from_millis(0),
+                                    ).await;
+                                });
                             }
                         }
 
@@ -90,15 +117,32 @@ impl Peer {
         )
         .into();
 
-        let default_conn_ids = Arc::new(ArcSwap::from_pointee(Vec::new()));
-
+        // 周期刷新 default_conn_ids，每 200ms 执行一次
         let conns_copy = conns.clone();
         let default_conn_ids_copy = default_conn_ids.clone();
-        let default_conn_id_clear_task = ScopedTask::from(tokio::spawn(async move {
+        let select_update_mutex_copy = select_update_mutex.clone();
+        let select_update_notify_copy = select_update_notify.clone();
+        let shutdown_notifier_copy = shutdown_notifier.clone();
+        let peer_node_id_copy = peer_node_id;
+        let default_conn_refresh_task = ScopedTask::from(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
             loop {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                if conns_copy.len() > 1 {
-                    default_conn_ids_copy.store(Arc::new(vec![PeerConnId::default()]));
+                select! {
+                    _ = shutdown_notifier_copy.notified() => {
+                        tracing::info!(?peer_node_id_copy, "default_conn refresher shutdown");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        // 调用抽取的刷新函数（可配置起始延迟，这里为0）
+                        Peer::refresh_default_conn_ids_with_delay(
+                            peer_node_id_copy,
+                            conns_copy.clone(),
+                            default_conn_ids_copy.clone(),
+                            select_update_mutex_copy.clone(),
+                            select_update_notify_copy.clone(),
+                            std::time::Duration::from_millis(0),
+                        ).await;
+                    }
                 }
             }
         }));
@@ -114,8 +158,60 @@ impl Peer {
 
             shutdown_notifier,
             default_conn_ids,
-            default_conn_id_clear_task,
+            select_update_mutex,
+            select_update_notify,
+            default_conn_refresh_task,
         }
+    }
+
+    fn refresh_default_conn_ids_with_delay_func(
+        &self,
+        delay: std::time::Duration,
+    ) -> impl std::future::Future<Output = bool> {
+        let peer_node_id_copy = self.peer_node_id;
+        let conns_copy = self.conns.clone();
+        let default_conn_ids_copy = self.default_conn_ids.clone();
+        let select_update_mutex_copy = self.select_update_mutex.clone();
+        let select_update_notify_copy = self.select_update_notify.clone();
+
+        async move {
+            Peer::refresh_default_conn_ids_with_delay(
+                peer_node_id_copy,
+                conns_copy,
+                default_conn_ids_copy,
+                select_update_mutex_copy,
+                select_update_notify_copy,
+                delay,
+            ).await
+        }
+    }
+
+    // 提供一个可复用的刷新函数，允许在刷新前 sleep 指定时长
+    async fn refresh_default_conn_ids_with_delay(
+        peer_node_id: PeerId,
+        conns: ConnMap,
+        default_conn_ids: Arc<ArcSwap<Vec<PeerConnId>>>,
+        select_update_mutex: Arc<tokio::sync::Mutex<()>>,
+        select_update_notify: Arc<tokio::sync::Notify>,
+        delay: std::time::Duration,
+    ) -> bool {
+        if delay.as_millis() > 0 {
+            tokio::time::sleep(delay).await;
+        }
+        if let Ok(_guard) = select_update_mutex.try_lock() {
+            // 计算 prefer_tcp
+            let mut prefer_tcp = false;
+            if let Ok(prefer_tcp_var) = std::env::var("PREFER_TCP") {
+                if prefer_tcp_var == "1" { prefer_tcp = true; }
+            }
+            // 重新计算并存储 default_conn_ids
+            let new_ids = Self::compute_default_conn_ids_from_conns(peer_node_id, &conns, prefer_tcp).await;
+            default_conn_ids.store(Arc::new(new_ids));
+            // 通知可能等待 select_conns 的协程
+            select_update_notify.notify_waiters();
+            return true;
+        }
+        false
     }
 
     pub async fn add_peer_conn(&self, mut conn: PeerConn) {
@@ -139,149 +235,146 @@ impl Peer {
 
         self.global_ctx
             .issue_event(GlobalCtxEvent::PeerConnAdded(conn_info));
+
+        // 立即触发一次刷新（不阻塞调用方）
+        self.refresh_default_conn_ids_with_delay_func(std::time::Duration::from_millis(0)).await;
     }
 
-    const MAX_CONN_AGE_MS: u64 = 800; // 800ms
+    // const MAX_CONN_AGE_MS: u64 = 800; // 800ms
+    const MAX_CONN_AGE_MS: u64 = 1_200; // 800ms
     // const MAX_CONN_AGE_MS: u64 = 1_500;           // 1.5s
     const TCP_PREFERENCE_DELTA_US: u64 = 50_000;  // 50ms (微秒)
 
-    async fn _do_select_conn(&self, filter_old: bool, prefer_tcp: bool) -> Vec<PeerConnId> {
-
-        #[derive(Clone, Debug)]
+    // 基于现有连接计算默认连接ID集合：
+    // - 有健康连接则返回单个（按延迟/偏好排序后的 primary）
+    // - 无健康连接则返回最近 3 个（可能 <3）
+    // - 若返回数量>1，且其中存在健康连接，则收敛为1个
+    async fn compute_default_conn_ids_from_conns(
+        peer_node_id: PeerId,
+        conns: &ConnMap,
+        prefer_tcp: bool,
+    ) -> Vec<PeerConnId> {
+        // 收集调试信息 + 健康候选（age <= MAX_CONN_AGE_MS）
         struct Cand {
             id: PeerConnId,
             latency_us: u64,
             is_tcp: bool,
-            conn_info: PeerConnInfo,
         }
 
+        let mut dbg_info: String = String::new();
         let mut cands: Vec<Cand> = Vec::new();
+        let mut all_conn_infos: Vec<(PeerConnId, PeerConnInfo)> = Vec::new();
 
-        // 单次遍历收集候选，避免不必要的 clone
-        for conn in self.conns.iter() {
+        for conn in conns.iter() {
             let info = conn.value().get_conn_info();
-            let stats = match info.stats.as_ref() {
-                Some(s) => s,
-                None => continue,
-            };
-            if filter_old && stats.last_response_age_ms > Peer::MAX_CONN_AGE_MS {
-                continue;
+            let stats = match info.stats.as_ref() { Some(s) => s, None => continue };
+            let tunnel_type = match info.tunnel.as_ref() { Some(t) => t.tunnel_type.as_str(), None => "" };
+            dbg_info.push_str(&format!(
+                "[id={} proto={} latency={}us age={}ms] ",
+                conn.get_conn_id(),
+                tunnel_type,
+                stats.latency_us,
+                stats.last_response_age_ms
+            ));
+
+            let is_tcp = tunnel_type == "tcp";
+            if stats.last_response_age_ms <= Peer::MAX_CONN_AGE_MS {
+                cands.push(Cand { id: conn.get_conn_id(), latency_us: stats.latency_us, is_tcp });
             }
-
-            let is_tcp = match info.tunnel.as_ref() {
-                Some(t) => t.tunnel_type.as_str() == "tcp",
-                None => false,
-            };
-
-            cands.push(Cand {
-                id: conn.get_conn_id(),
-                latency_us: stats.latency_us,
-                is_tcp,
-                conn_info: info,
-            });
+            all_conn_infos.push((conn.get_conn_id(), info));
         }
 
-        tracing::debug!(
-            ?self.peer_node_id,
-            filter_old,
-            prefer_tcp,
-            conn_count = self.conns.len(),
-            "selecting peer conns from: {:?}",
-            cands,
-        );
+        let mut out: Vec<PeerConnId> = Vec::new();
 
-
-        if cands.is_empty() {
-            return Vec::new();
-        }
-
-        // 先按延迟升序排序，得到全局最优在 index 0
-        cands.sort_by_key(|c| c.latency_us);
-
-        let best_overall_latency = cands[0].latency_us;
-
-        // 找到最优 TCP（如果有）
-        let best_tcp_idx_and_latency = cands
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.is_tcp)
-            .min_by_key(|(_, c)| c.latency_us)
-            .map(|(i, c)| (i, c.latency_us));
-
-        // 确定置顶元素（primary）
-        let mut primary_idx = 0usize;
-        if prefer_tcp {
-            if let Some((tcp_idx, best_tcp_latency)) = best_tcp_idx_and_latency {
-                let diff = if best_overall_latency > best_tcp_latency {
-                    best_overall_latency - best_tcp_latency
-                } else {
-                    best_tcp_latency - best_overall_latency
-                };
-                if diff < Peer::TCP_PREFERENCE_DELTA_US {
-                    primary_idx = tcp_idx;
+        if !cands.is_empty() {
+            // 有健康候选：按延迟 + TCP 偏好选择 primary，并仅返回1个
+            cands.sort_by_key(|c| c.latency_us);
+            let best_overall_latency = cands[0].latency_us;
+            let best_tcp_idx_and_latency = cands
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.is_tcp)
+                .min_by_key(|(_, c)| c.latency_us)
+                .map(|(i, c)| (i, c.latency_us));
+            let mut primary_idx = 0usize;
+            if prefer_tcp {
+                if let Some((tcp_idx, best_tcp_latency)) = best_tcp_idx_and_latency {
+                    let diff = if best_overall_latency > best_tcp_latency {
+                        best_overall_latency - best_tcp_latency
+                    } else {
+                        best_tcp_latency - best_overall_latency
+                    };
+                    if diff < Peer::TCP_PREFERENCE_DELTA_US {
+                        primary_idx = tcp_idx;
+                    }
                 }
             }
+            out = cands.into_iter().map(|c| c.id).collect();
+            if primary_idx != 0 {
+                let chosen = out.remove(primary_idx);
+                out.insert(0, chosen);
+            }
+            out.truncate(1);
+        } else {
+            // 无健康候选：返回按最近响应排序的最多3个
+            all_conn_infos.sort_by_key(|(_, info)| info.stats.as_ref().map_or(u64::MAX, |s| s.latency_us));
+            out = all_conn_infos.iter().map(|(id, _)| *id).take(3).collect();
+
+            // // 额外检查：仅检查 out 中的 id，利用已收集的 PeerConnInfo，避免额外 get_stats
+            // if out.len() > 1 {
+            //     let mut age_map: std::collections::HashMap<PeerConnId, u64> = std::collections::HashMap::new();
+            //     for (id, info) in &all_conn_infos {
+            //         if let Some(s) = info.stats.as_ref() {
+            //             age_map.insert(*id, s.last_response_age_ms);
+            //         }
+            //     }
+            //     let mut has_healthy = false;
+            //     for id in out.iter() {
+            //         if let Some(age) = age_map.get(id) {
+            //             if *age <= Peer::MAX_CONN_AGE_MS { has_healthy = true; break; }
+            //         }
+            //     }
+            //     if has_healthy {
+            //         out.truncate(1);
+            //     }
+            // }
         }
 
-        // 生成返回列表：把 primary 移到最前，其余保持延迟升序
-        let total_candidates = cands.len();
-        let primary_info = cands[primary_idx].conn_info.clone();
-        let mut out: Vec<PeerConnId> = cands.into_iter().map(|c| c.id).collect();
-        if primary_idx != 0 {
-            let chosen = out.remove(primary_idx);
-            out.insert(0, chosen);
-        }
-
-        // 精简日志，避免使用已移动的数据
-        tracing::debug!(
-            "peer {} selected primary conn (tcp_pref={}, total_candidates={}): {:?}",
-            self.peer_node_id,
+        tracing::info!(
+            ?peer_node_id,
             prefer_tcp,
-            total_candidates,
-            primary_info,
+            "selecting default peer conns from: {} => {:?}",
+            dbg_info,
+            out,
         );
 
         out
     }
 
-    async fn _do_select_conn_recent(&self) -> Vec<PeerConnId> {
-        let mut conn_infos: Vec<(PeerConnId, PeerConnInfo)> = vec![];
-        for conn in self.conns.iter() {
-            let conn_info = conn.value().get_conn_info();
-            // let stats = match conn_info.stats.as_ref() { Some(s) => s, None => continue };
-            // if stats.last_response_age_ms > Peer::MAX_CONN_AGE_MS { continue; }
-            conn_infos.push((conn.get_conn_id(), conn_info));
-        }
-        // sort by last_response_age_ms
-        conn_infos.sort_by_key(|(_, info)| info.stats.as_ref().map_or(u64::MAX, |s| s.last_response_age_ms));
-        conn_infos.into_iter().map(|(id, _)| id).collect()
-    }
-
     async fn select_conns(&self) -> Vec<ArcPeerConn> {
-        let default_conn_ids = self.default_conn_ids.load();
-        if !default_conn_ids.is_empty() {
-            let mut conns = vec![];
-            for conn_id in default_conn_ids.iter() {
-                if let Some(conn) = self.conns.get(conn_id) {
-                    conns.push(conn.clone());
+        // 快路径：已有默认连接
+        let mut default_conn_ids = self.default_conn_ids.load();
+        if default_conn_ids.is_empty() {
+            if !self.refresh_default_conn_ids_with_delay_func(std::time::Duration::from_millis(0)).await {
+                // 等待通知直到有默认连接或连接数为0（无法产生默认连接）
+                loop {
+                    self.select_update_notify.notified().await;
+                    let ids = self.default_conn_ids.load();
+                    if !ids.is_empty() || self.conns.is_empty() { break; }
                 }
             }
-            if !conns.is_empty() {
-                return conns;
-            }
+            default_conn_ids = self.default_conn_ids.load();
         }
 
-        let conn_ids = self._do_select_conn(true, true).await;
-        if !conn_ids.is_empty() {
-            self.default_conn_ids.store(Arc::new(conn_ids.iter().take(1).cloned().collect()));
-        } else {
-            let conn_ids = self._do_select_conn_recent().await;
-            tracing::warn!("peer {} has no healthy conn, selecting 3 most recent conns!", self.peer_node_id);
-            self.default_conn_ids.store(Arc::new(conn_ids.iter().take(3).cloned().collect()));
-        }
+        // if default_conn_ids.len() > 1 {
+        //     let fun = self.refresh_default_conn_ids_with_delay_func(std::time::Duration::from_millis(10));
+        //     tokio::spawn(async move {
+        //         fun.await;
+        //     });
+        // }
 
+        // 直接返回缓存的默认连接（不再在此处做健康检查，以减少 get_stats 调用）
         let mut conns = vec![];
-        let default_conn_ids = self.default_conn_ids.load();
         for conn_id in default_conn_ids.iter() {
             if let Some(conn) = self.conns.get(conn_id) {
                 conns.push(conn.clone());

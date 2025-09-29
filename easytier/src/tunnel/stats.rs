@@ -83,19 +83,25 @@ impl WindowLatency {
 
 #[derive(Debug)]
 pub struct Throughput {
+    start_time: Instant,
     tx_bytes: UnsafeCell<u64>,
     rx_bytes: UnsafeCell<u64>,
     tx_packets: UnsafeCell<u64>,
     rx_packets: UnsafeCell<u64>,
+    last_tx: UnsafeCell<u64>,
+    last_rx: UnsafeCell<u64>,
 }
 
 impl Clone for Throughput {
     fn clone(&self) -> Self {
         Self {
+            start_time: self.start_time,
             tx_bytes: UnsafeCell::new(unsafe { *self.tx_bytes.get() }),
             rx_bytes: UnsafeCell::new(unsafe { *self.rx_bytes.get() }),
             tx_packets: UnsafeCell::new(unsafe { *self.tx_packets.get() }),
             rx_packets: UnsafeCell::new(unsafe { *self.rx_packets.get() }),
+            last_tx: UnsafeCell::new(unsafe { *self.last_tx.get() }),
+            last_rx: UnsafeCell::new(unsafe { *self.last_rx.get() }),
         }
     }
 }
@@ -107,10 +113,13 @@ unsafe impl Sync for Throughput {}
 impl Default for Throughput {
     fn default() -> Self {
         Self {
+            start_time: Instant::now(),
             tx_bytes: UnsafeCell::new(0),
             rx_bytes: UnsafeCell::new(0),
             tx_packets: UnsafeCell::new(0),
             rx_packets: UnsafeCell::new(0),
+            last_tx: UnsafeCell::new(0),
+            last_rx: UnsafeCell::new(0),
         }
     }
 }
@@ -136,10 +145,18 @@ impl Throughput {
         unsafe { *self.rx_packets.get() }
     }
 
+    pub fn last_tx_age_ms(&self) -> u64 {
+        self.start_time.elapsed().as_millis() as u64 - unsafe { *self.last_tx.get() }
+    }
+    pub fn last_rx_age_ms(&self) -> u64 {
+        self.start_time.elapsed().as_millis() as u64 - unsafe { *self.last_rx.get() }
+    }
+
     pub fn record_tx_bytes(&self, bytes: u64) {
         unsafe {
             *self.tx_bytes.get() += bytes;
             *self.tx_packets.get() += 1;
+            *self.last_tx.get() = self.start_time.elapsed().as_millis() as u64;
         }
     }
 
@@ -147,6 +164,7 @@ impl Throughput {
         unsafe {
             *self.rx_bytes.get() += bytes;
             *self.rx_packets.get() += 1;
+            *self.last_rx.get() = self.start_time.elapsed().as_millis() as u64;
         }
     }
 }

@@ -500,8 +500,9 @@ impl PeerConn {
     pub fn get_stats(&self) -> PeerConnStats {
         PeerConnStats {
             latency_us: self.latency_stats.get_latency_us(),
-            last_response_age_ms: self.latency_stats.get_last_response_age_ms(),
+            // last_response_age_ms: self.latency_stats.get_last_response_age_ms(),
             loss_rate: self.loss_rate_stats.load(Ordering::Relaxed) as f32 / 100.0,
+            last_response_age_ms: self.throughput.last_rx_age_ms(),
 
             tx_bytes: self.throughput.tx_bytes(),
             rx_bytes: self.throughput.rx_bytes(),
