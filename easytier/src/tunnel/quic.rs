@@ -25,20 +25,25 @@ use super::{
 };
 
 pub fn setup_transport_config(transport_config: &mut TransportConfig) -> &mut TransportConfig {
-    
+    const INIT_WINDOW: u32 = 1 * 1024 * 1024;
+    const TRANSFER_WINDOW: u32 = 64 * 1024 * 1024;
+    const STREAM_WINDOW: u32 = 12 * 1024 * 1024;
+    const ACK_DELAY: u32 = 4;
+    const PKT_THRESHOLD: u32 = 25;
+
     let mut bbr_config = BbrConfig::default();
-    bbr_config.initial_window(768 * 1024); // GPT推荐激进时设置512K~2M，选择较保守配置
+    bbr_config.initial_window(INIT_WINDOW as u64); // GPT推荐激进时设置512K~2M，选择较保守配置
     transport_config.congestion_controller_factory(Arc::new(bbr_config));
     
     let mut ack_frequency_config = AckFrequencyConfig::default();
-    ack_frequency_config.max_ack_delay(Some(Duration::from_millis(4))); // GPT 推荐2~5ms
-    ack_frequency_config.reordering_threshold(VarInt::from_u32(12));
+    ack_frequency_config.max_ack_delay(Some(Duration::from_millis(ACK_DELAY as u64))); // GPT 推荐2~5ms
+    ack_frequency_config.reordering_threshold(VarInt::from_u32(PKT_THRESHOLD - 1));
     transport_config.ack_frequency_config(Some(ack_frequency_config));
 
-    transport_config.receive_window(VarInt::from_u32(128 * 1024 * 1024));       // GPT推荐128M
-    transport_config.send_window(128 * 1024 * 1024);                            // GPT推荐128M
-    transport_config.packet_threshold(12);
-    transport_config.stream_receive_window(VarInt::from_u32(12 * 1024 * 1024)); // GPT推荐延迟高时增加recv window 8~16M按需
+    transport_config.receive_window(VarInt::from_u32(TRANSFER_WINDOW));       // GPT推荐128M
+    transport_config.send_window(TRANSFER_WINDOW as u64);                            // GPT推荐128M
+    transport_config.packet_threshold(PKT_THRESHOLD);
+    transport_config.stream_receive_window(VarInt::from_u32(STREAM_WINDOW)); // GPT推荐延迟高时增加recv window 8~16M按需
     transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
     return transport_config;
 }
