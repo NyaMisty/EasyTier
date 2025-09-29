@@ -15,7 +15,7 @@ use anyhow::Context;
 use quinn::{
     congestion::BbrConfig, crypto::rustls::QuicClientConfig, udp::RecvMeta, AsyncUdpSocket,
     ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig, TransportConfig, UdpPoller,
-    VarInt,
+    VarInt, AckFrequencyConfig,
 };
 
 use super::{
@@ -24,23 +24,36 @@ use super::{
     IpVersion, Tunnel, TunnelConnector, TunnelError, TunnelListener,
 };
 
+pub fn setup_transport_config(transport_config: &mut TransportConfig) -> &mut TransportConfig {
+    
+    let mut bbr_config = BbrConfig::default();
+    bbr_config.initial_window(768 * 1024); // GPT推荐激进时设置512K~2M，选择较保守配置
+    transport_config.congestion_controller_factory(Arc::new(bbr_config));
+    
+    let mut ack_frequency_config = AckFrequencyConfig::default();
+    ack_frequency_config.max_ack_delay(Some(Duration::from_millis(4))); // GPT 推荐2~5ms
+    ack_frequency_config.reordering_threshold(VarInt::from_u32(12));
+    transport_config.ack_frequency_config(Some(ack_frequency_config));
+
+    transport_config.receive_window(VarInt::from_u32(128 * 1024 * 1024));       // GPT推荐128M
+    transport_config.send_window(128 * 1024 * 1024);                            // GPT推荐128M
+    transport_config.packet_threshold(12);
+    transport_config.stream_receive_window(VarInt::from_u32(12 * 1024 * 1024)); // GPT推荐延迟高时增加recv window 8~16M按需
+    transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
+    return transport_config;
+}
+
 pub fn configure_client() -> ClientConfig {
     let client_crypto = QuicClientConfig::try_from(get_insecure_tls_client_config()).unwrap();
     let mut client_config = ClientConfig::new(Arc::new(client_crypto));
 
+    
     // // Create a new TransportConfig and set BBR
     let mut transport_config = TransportConfig::default();
+    setup_transport_config(&mut transport_config);
     
-    let mut bbr_config = BbrConfig::default();
-    bbr_config.initial_window(10 * 1024 * 1024);
-    transport_config.congestion_controller_factory(Arc::new(bbr_config));
-    transport_config.receive_window(VarInt::from_u32(32 * 1024 * 1024));
-    transport_config.send_window(32 * 1024 * 1024);
-    transport_config.stream_receive_window(VarInt::from_u32(8 * 1024 * 1024));
-    transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
     // Replace the default TransportConfig with the transport_config() method
     client_config.transport_config(Arc::new(transport_config));
-
     client_config
 }
 
@@ -119,15 +132,10 @@ pub fn configure_server() -> Result<(ServerConfig, Vec<u8>), Box<dyn Error>> {
 
     let mut server_config = ServerConfig::with_single_cert(certs.clone(), key)?;
     let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
+
+    let transport_config = setup_transport_config(transport_config);
     transport_config.max_concurrent_uni_streams(10_u8.into());
     transport_config.max_concurrent_bidi_streams(10_u8.into());
-    // Setting BBR congestion control
-    let mut bbr_config = BbrConfig::default();
-    bbr_config.initial_window(10 * 1024 * 1024);
-    transport_config.congestion_controller_factory(Arc::new(bbr_config));
-    transport_config.receive_window(VarInt::from_u32(32 * 1024 * 1024));
-    transport_config.send_window(32 * 1024 * 1024);
-    transport_config.stream_receive_window(VarInt::from_u32(8 * 1024 * 1024));
 
     Ok((server_config, certs[0].to_vec()))
 }
