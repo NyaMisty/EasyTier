@@ -92,10 +92,22 @@ impl<T> ZCPacketSink for T where T: Sink<SinkItem, Error = SinkError> + Send {}
 
 pub type SplitTunnel = (Pin<Box<dyn ZCPacketStream>>, Pin<Box<dyn ZCPacketSink>>);
 
+/// Tunnel 层的度量信息（如 TCP 的 in-flight 字节数）
+#[derive(Debug, Clone, Default)]
+pub struct TunnelMetrics {
+    /// 在途字节数（如果 tunnel 支持，如 TCP）
+    pub inflight_bytes: Option<u64>,
+}
+
 #[auto_impl::auto_impl(Box, Arc)]
 pub trait Tunnel: Send {
     fn split(&self) -> SplitTunnel;
     fn info(&self) -> Option<TunnelInfo>;
+    
+    /// 获取 tunnel 层的度量信息（可选，默认返回 None）
+    fn get_metrics(&self) -> Option<TunnelMetrics> {
+        None
+    }
 }
 
 #[auto_impl::auto_impl(Arc)]

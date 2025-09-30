@@ -20,6 +20,8 @@ pub mod encrypt;
 
 pub mod peer_task;
 
+pub mod multipath_scheduler;
+
 #[cfg(test)]
 pub mod tests;
 

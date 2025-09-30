@@ -11,6 +11,7 @@ use crate::proto::common::TunnelInfo;
 use self::stats::Throughput;
 
 use super::*;
+use super::packet_def::PacketType;
 
 #[auto_impl(Arc, Box)]
 pub trait TunnelFilter: Send + Sync {
@@ -265,14 +266,26 @@ impl TunnelFilter for StatsRecorderTunnelFilter {
     type FilterOutput = Arc<Throughput>;
 
     fn before_send(&self, data: SinkItem) -> Option<SinkItem> {
-        self.throughput.record_tx_bytes(data.buf_len() as u64);
+        let mut is_data = true;
+        if let Some(peer_mgr_hdr) = data.peer_manager_header() {
+            if peer_mgr_hdr.packet_type == PacketType::Ping as u8 || peer_mgr_hdr.packet_type == PacketType::Pong as u8 {
+                is_data = false;
+            }
+        }
+        self.throughput.record_tx_bytes(data.buf_len() as u64, is_data);
         Some(data)
     }
 
     fn after_received(&self, data: StreamItem) -> Option<StreamItem> {
         match data {
             Ok(v) => {
-                self.throughput.record_rx_bytes(v.buf_len() as u64);
+                let mut is_data = true;
+                if let Some(peer_mgr_hdr) = v.peer_manager_header() {
+                    if peer_mgr_hdr.packet_type == PacketType::Ping as u8 || peer_mgr_hdr.packet_type == PacketType::Pong as u8 {
+                        is_data = false;
+                    }
+                }
+                self.throughput.record_rx_bytes(v.buf_len() as u64, is_data);
                 Some(Ok(v))
             }
             Err(e) => Some(Err(e)),

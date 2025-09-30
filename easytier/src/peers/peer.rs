@@ -10,6 +10,7 @@ use tracing::Instrument;
 use super::{
     peer_conn::{PeerConn, PeerConnId},
     PacketRecvChan,
+    multipath_scheduler::{Scheduler as MultipathScheduler, Config as SchedulerConfig, PickInput, PathSnapshot},
 };
 use crate::{common::scoped_task::ScopedTask, proto::cli::PeerConnInfo};
 use crate::{
@@ -36,11 +37,12 @@ pub struct Peer {
 
     shutdown_notifier: Arc<tokio::sync::Notify>,
 
+    // 多路径调度器相关
+    multipath_scheduler: Arc<MultipathScheduler>,
     default_conn_ids: Arc<ArcSwap<Vec<PeerConnId>>>,
-    // 新增：控制选择更新的互斥和通知，替换原清理任务
-    select_update_mutex: Arc<tokio::sync::Mutex<()>>, // 保证同一时间只有一个更新任务在运行
-    select_update_notify: Arc<tokio::sync::Notify>,    // 通知等待者更新已完成
-    default_conn_refresh_task: ScopedTask<()>,         // 200ms 周期刷新任务
+    select_update_mutex: Arc<tokio::sync::Mutex<()>>,
+    select_update_notify: Arc<tokio::sync::Notify>,
+    default_conn_refresh_task: ScopedTask<()>,
 }
 
 impl Peer {
@@ -147,6 +149,10 @@ impl Peer {
             }
         }));
 
+        // 创建多路径调度器
+        let scheduler_config = SchedulerConfig::default();
+        let multipath_scheduler = Arc::new(MultipathScheduler::new(scheduler_config));
+
         Peer {
             peer_node_id,
             conns: conns.clone(),
@@ -157,6 +163,7 @@ impl Peer {
             close_event_listener,
 
             shutdown_notifier,
+            multipath_scheduler,
             default_conn_ids,
             select_update_mutex,
             select_update_notify,
@@ -245,110 +252,101 @@ impl Peer {
     // const MAX_CONN_AGE_MS: u64 = 1_500;           // 1.5s
     const TCP_PREFERENCE_DELTA_US: u64 = 50_000;  // 50ms (微秒)
 
-    // 基于现有连接计算默认连接ID集合：
-    // - 有健康连接则返回单个（按延迟/偏好排序后的 primary）
-    // - 无健康连接则返回最近 3 个（可能 <3）
-    // - 若返回数量>1，且其中存在健康连接，则收敛为1个
+    // 使用 multipath 调度器选择最佳连接
     async fn compute_default_conn_ids_from_conns(
         peer_node_id: PeerId,
         conns: &ConnMap,
-        prefer_tcp: bool,
+        _prefer_tcp: bool,
     ) -> Vec<PeerConnId> {
-        // 收集调试信息 + 健康候选（age <= MAX_CONN_AGE_MS）
-        struct Cand {
-            id: PeerConnId,
-            latency_us: u64,
-            is_tcp: bool,
+        if conns.is_empty() {
+            return vec![];
         }
 
-        let mut dbg_info: String = String::new();
-        let mut cands: Vec<Cand> = Vec::new();
-        let mut all_conn_infos: Vec<(PeerConnId, PeerConnInfo)> = Vec::new();
-
+        // 构建PathSnapshot列表
+        let mut path_snapshots: Vec<(PeerConnId, PathSnapshot)> = Vec::new();
+        
         for conn in conns.iter() {
-            let info = conn.value().get_conn_info();
-            let stats = match info.stats.as_ref() { Some(s) => s, None => continue };
-            let tunnel_type = match info.tunnel.as_ref() { Some(t) => t.tunnel_type.as_str(), None => "" };
-            dbg_info.push_str(&format!(
-                "[id={} proto={} latency={}us age={}ms] ",
-                conn.get_conn_id(),
-                tunnel_type,
-                stats.latency_us,
-                stats.last_response_age_ms
-            ));
-
-            let is_tcp = tunnel_type == "tcp";
-            if stats.last_response_age_ms <= Peer::MAX_CONN_AGE_MS {
-                cands.push(Cand { id: conn.get_conn_id(), latency_us: stats.latency_us, is_tcp });
-            }
-            all_conn_infos.push((conn.get_conn_id(), info));
+            let conn_ref = conn.value();
+            let conn_id = conn.get_conn_id();
+            
+            // 注意：由于 tunnel 在 PeerConn 中被多层包装为 Any 类型，
+            // 直接获取 tunnel metrics 比较困难。
+            // 这里先使用 None，让 get_path_snapshot 内部使用 Throughput 估算。
+            // 未来可以考虑在 PeerConn 初始化时缓存 tunnel 引用。
+            let tunnel_metrics = None;
+            
+            // 构造PathSnapshot
+            let snapshot = conn_ref.get_path_snapshot(conn_id.as_u128() as u64, tunnel_metrics);
+            path_snapshots.push((conn_id, snapshot));
         }
 
-        let mut out: Vec<PeerConnId> = Vec::new();
+        if path_snapshots.is_empty() {
+            return vec![];
+        }
 
-        if !cands.is_empty() {
-            // 有健康候选：按延迟 + TCP 偏好选择 primary，并仅返回1个
-            cands.sort_by_key(|c| c.latency_us);
-            let best_overall_latency = cands[0].latency_us;
-            let best_tcp_idx_and_latency = cands
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| c.is_tcp)
-                .min_by_key(|(_, c)| c.latency_us)
-                .map(|(i, c)| (i, c.latency_us));
-            let mut primary_idx = 0usize;
-            if prefer_tcp {
-                if let Some((tcp_idx, best_tcp_latency)) = best_tcp_idx_and_latency {
-                    let diff = if best_overall_latency > best_tcp_latency {
-                        best_overall_latency - best_tcp_latency
-                    } else {
-                        best_tcp_latency - best_overall_latency
-                    };
-                    if diff < Peer::TCP_PREFERENCE_DELTA_US {
-                        primary_idx = tcp_idx;
-                    }
-                }
-            }
-            out = cands.into_iter().map(|c| c.id).collect();
-            if primary_idx != 0 {
-                let chosen = out.remove(primary_idx);
-                out.insert(0, chosen);
-            }
-            out.truncate(1);
+        // 使用multipath调度器选择
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        
+        // 获取流量统计用于flow_bytes_sent
+        let flow_bytes_sent = if let Some(first_conn) = conns.iter().next() {
+            first_conn.value().get_throughput().get_recent_tx_bytes()
         } else {
-            // 无健康候选：返回按最近响应排序的最多3个
-            all_conn_infos.sort_by_key(|(_, info)| info.stats.as_ref().map_or(u64::MAX, |s| s.latency_us));
-            out = all_conn_infos.iter().map(|(id, _)| *id).take(3).collect();
+            0
+        };
 
-            // // 额外检查：仅检查 out 中的 id，利用已收集的 PeerConnInfo，避免额外 get_stats
-            // if out.len() > 1 {
-            //     let mut age_map: std::collections::HashMap<PeerConnId, u64> = std::collections::HashMap::new();
-            //     for (id, info) in &all_conn_infos {
-            //         if let Some(s) = info.stats.as_ref() {
-            //             age_map.insert(*id, s.last_response_age_ms);
-            //         }
-            //     }
-            //     let mut has_healthy = false;
-            //     for id in out.iter() {
-            //         if let Some(age) = age_map.get(id) {
-            //             if *age <= Peer::MAX_CONN_AGE_MS { has_healthy = true; break; }
-            //         }
-            //     }
-            //     if has_healthy {
-            //         out.truncate(1);
-            //     }
-            // }
-        }
+        let input = PickInput {
+            now_ms,
+            packet_len: 1500, // 假设标准MTU
+            flow_bytes_sent,
+            critical: false,
+            paths: path_snapshots.iter().map(|(_, s)| s.clone()).collect(),
+        };
 
         tracing::info!(
             ?peer_node_id,
-            prefer_tcp,
-            "selecting default peer conns from: {} => {:?}",
-            dbg_info,
-            out,
+            "multipath scheduler input: now_ms={}, packet_len={}, flow_bytes_sent={}, paths_count={}",
+            input.now_ms,
+            input.packet_len,
+            input.flow_bytes_sent,
+            input.paths.len()
         );
 
-        out
+        // 使用默认调度器配置选择
+        let scheduler = MultipathScheduler::new(SchedulerConfig::default());
+        if let Some(decision) = scheduler.pick_path(&input) {
+            let mut selected_ids = vec![];
+            
+            // 添加primary路径
+            if let Some((conn_id, _)) = path_snapshots.iter()
+                .find(|(_, s)| s.id == decision.primary) {
+                selected_ids.push(*conn_id);
+            }
+            
+            // 添加redundant路径（如果有）
+            if let Some(redundant_id) = decision.redundant {
+                if let Some((conn_id, _)) = path_snapshots.iter()
+                    .find(|(_, s)| s.id == redundant_id) {
+                    selected_ids.push(*conn_id);
+                }
+            }
+
+            tracing::info!(
+                ?peer_node_id,
+                "multipath selected: primary={}, redundant={:?}, conn_ids={:?}",
+                decision.primary,
+                decision.redundant,
+                selected_ids
+            );
+
+            selected_ids
+        } else {
+            // 没有可用路径，返回第一个作为fallback
+            tracing::warn!(?peer_node_id, "multipath scheduler returned no path, using fallback");
+            vec![path_snapshots[0].0]
+        }
     }
 
     async fn select_conns(&self) -> Vec<ArcPeerConn> {

@@ -538,6 +538,101 @@ impl PeerConn {
     pub fn get_my_peer_id(&self) -> PeerId {
         self.my_peer_id
     }
+    
+    /// 获取吞吐量统计对象的引用（用于 multipath 调度器等）
+    pub fn get_throughput(&self) -> &Arc<Throughput> {
+        &self.throughput
+    }
+    
+    /// 构造路径快照（用于多路径调度器）
+    /// 
+    /// # 参数
+    /// 
+    /// * `path_id` - 路径唯一标识
+    /// * `tunnel_metrics` - 可选的 tunnel 层度量信息（如 TCP 的 inflight_bytes）
+    /// 
+    /// # 实现说明
+    /// 
+    /// 各参数从以下来源获取：
+    /// 
+    /// * `srtt_ms`, `rttvar_ms`, `min_rtt_ms` - 从 `WindowLatency` 获取
+    /// * `bw_est_Bps` - 从 `Throughput` 的带宽估计获取
+    /// * `loss_rate` - 从 `PeerConnStats` 获取
+    /// * `inflight_bytes` - 分为两类：
+    ///   1. Tunnel 支持汇报（如 TCP）：使用 `TunnelMetrics.inflight_bytes`
+    ///   2. Tunnel 不支持（如 UDP）：通过 `Throughput.estimate_inflight(srtt, gamma=1.3)` 估算
+    /// * `last_tx_age_ms` - 从 `Throughput` 获取
+    /// * `active` - 始终为 `true`
+    /// 
+    /// # 示例
+    /// 
+    /// ```ignore
+    /// // 不带 tunnel metrics（UDP 等）
+    /// let snapshot = peer_conn.get_path_snapshot(1, None);
+    /// 
+    /// // 带 tunnel metrics（TCP 等）
+    /// let metrics = TunnelMetrics {
+    ///     inflight_bytes: Some(1024),
+    /// };
+    /// let snapshot = peer_conn.get_path_snapshot(1, Some(metrics));
+    /// ```
+    pub fn get_path_snapshot(
+        &self,
+        path_id: u64,
+        tunnel_metrics: Option<crate::tunnel::TunnelMetrics>,
+    ) -> crate::peers::multipath_scheduler::PathSnapshot {
+        use crate::peers::multipath_scheduler::PathSnapshot;
+        
+        // 获取 srtt (us -> ms)
+        let srtt_us = self.latency_stats.get_latency_us::<u32>();
+        let srtt_ms = (srtt_us as f32) / 1000.0;
+        
+        // 获取 rttvar (us -> ms)
+        let rttvar_us = self.latency_stats.get_rttvar_us();
+        let rttvar_ms = (rttvar_us as f32) / 1000.0;
+        
+        // 获取 min_rtt (us -> ms)
+        let min_rtt_us = self.latency_stats.get_min_rtt_us();
+        let min_rtt_ms = (min_rtt_us as f32) / 1000.0;
+        
+        // 获取带宽估计 (Bytes/s)
+        let bw_est_bps = self.throughput.get_bw_est_bps();
+        
+        // 获取丢包率 (0.0..1.0)
+        // loss_rate_stats 存储的是百分比数值（例如5表示5%），除以100.0转为0-1范围
+        let loss_rate = self.loss_rate_stats.load(Ordering::Relaxed) as f32 / 100.0;
+        
+        // 获取 inflight_bytes
+        // 优先使用 tunnel 层汇报的值（如 TCP），否则通过 Throughput 估算
+        let inflight_bytes = if let Some(metrics) = tunnel_metrics {
+            if let Some(tunnel_inflight) = metrics.inflight_bytes {
+                tunnel_inflight as u32
+            } else {
+                // tunnel 不支持，使用 Throughput 估算，gamma=1.3
+                let srtt_ms_u32 = srtt_ms.max(1.0) as u32;
+                self.throughput.estimated_inflight_bytes(srtt_ms_u32, 1.3) as u32
+            }
+        } else {
+            // 没有 tunnel metrics，使用 Throughput 估算
+            let srtt_ms_u32 = srtt_ms.max(1.0) as u32;
+            self.throughput.estimated_inflight_bytes(srtt_ms_u32, 1.3) as u32
+        };
+        
+        // 获取 last_tx_age_ms
+        let last_tx_age_ms = self.throughput.last_tx_age_ms() as u32;
+        
+        PathSnapshot {
+            id: path_id,
+            srtt_ms,
+            rttvar_ms,
+            min_rtt_ms,
+            bw_est_bps,
+            loss_rate,
+            inflight_bytes,
+            last_tx_age_ms,
+            active: true, // 始终为 true
+        }
+    }
 }
 
 impl Drop for PeerConn {
@@ -656,7 +751,7 @@ mod tests {
             }
             loop {
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                throughput.record_rx_bytes(3);
+                throughput.record_rx_bytes(3, false);
             }
         }));
 
@@ -697,5 +792,61 @@ mod tests {
             .unwrap()
             .unwrap_err();
         let _ = tokio::join!(j);
+    }
+    
+    #[tokio::test]
+    async fn test_path_snapshot_construction() {
+        use crate::tunnel::TunnelMetrics;
+        
+        let (c, s) = create_ring_tunnel_pair();
+        let c_peer_id = new_peer_id();
+        let s_peer_id = new_peer_id();
+
+        let mut c_peer = PeerConn::new(c_peer_id, get_mock_global_ctx(), Box::new(c));
+        let mut s_peer = PeerConn::new(s_peer_id, get_mock_global_ctx(), Box::new(s));
+
+        // 执行握手
+        let (c_ret, s_ret) = tokio::join!(
+            c_peer.do_handshake_as_client(),
+            s_peer.do_handshake_as_server()
+        );
+        assert!(c_ret.is_ok());
+        assert!(s_ret.is_ok());
+
+        // 模拟一些延迟数据
+        c_peer.latency_stats.record_latency(50000); // 50ms
+        c_peer.latency_stats.record_latency(60000); // 60ms
+        c_peer.latency_stats.record_latency(40000); // 40ms
+        
+        // 设置丢包率（存储格式：百分比数值，5表示5%）
+        c_peer.loss_rate_stats.store(5, Ordering::Relaxed); // 5%
+        
+        // 模拟一些发送流量
+        c_peer.throughput.record_tx_bytes(1024, true);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        c_peer.throughput.record_tx_bytes(2048, true);
+
+        // 测试不带 tunnel metrics（使用 Throughput 估算）
+        let snapshot1 = c_peer.get_path_snapshot(1, None);
+        assert_eq!(snapshot1.id, 1);
+        assert!(snapshot1.srtt_ms > 0.0);
+        assert!(snapshot1.active);
+        assert_eq!(snapshot1.loss_rate, 0.05);
+        
+        // 测试带 tunnel metrics
+        let metrics = TunnelMetrics {
+            inflight_bytes: Some(4096),
+        };
+        let snapshot2 = c_peer.get_path_snapshot(2, Some(metrics));
+        assert_eq!(snapshot2.id, 2);
+        assert_eq!(snapshot2.inflight_bytes, 4096);
+        
+        // 测试 tunnel 不支持 inflight 的情况
+        let metrics_no_inflight = TunnelMetrics {
+            inflight_bytes: None,
+        };
+        let snapshot3 = c_peer.get_path_snapshot(3, Some(metrics_no_inflight));
+        // inflight_bytes 应该通过 Throughput 估算（值是非负的）
+        println!("估算的 inflight_bytes: {}", snapshot3.inflight_bytes);
     }
 }

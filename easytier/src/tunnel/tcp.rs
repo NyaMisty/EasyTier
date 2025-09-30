@@ -1,4 +1,6 @@
 use std::net::SocketAddr;
+use std::os::fd::AsRawFd;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::stream::FuturesUnordered;
@@ -10,10 +12,35 @@ use crate::tunnel::common::setup_sokcet2;
 use super::{
     check_scheme_and_get_socket_addr,
     common::{wait_for_connect_futures, FramedReader, FramedWriter, TunnelWrapper},
-    IpVersion, Tunnel, TunnelError, TunnelListener,
+    IpVersion, Tunnel, TunnelError, TunnelListener, TunnelMetrics,
 };
 
 const TCP_MTU_BYTES: usize = 2000;
+
+/// TCP tunnel 包装器，实现 get_metrics
+struct TcpTunnel {
+    inner: TunnelWrapper<
+        FramedReader<tokio::net::tcp::OwnedReadHalf>,
+        FramedWriter<tokio::net::tcp::OwnedWriteHalf, super::common::TcpZCPacketToBytes>
+    >,
+    metadata: Arc<TcpTunnelMetadata>,
+}
+
+impl Tunnel for TcpTunnel {
+    fn split(&self) -> (std::pin::Pin<Box<dyn super::ZCPacketStream>>, std::pin::Pin<Box<dyn super::ZCPacketSink>>) {
+        self.inner.split()
+    }
+    
+    fn info(&self) -> Option<TunnelInfo> {
+        self.inner.info()
+    }
+    
+    fn get_metrics(&self) -> Option<TunnelMetrics> {
+        Some(TunnelMetrics {
+            inflight_bytes: self.metadata.get_inflight_bytes(),
+        })
+    }
+}
 
 #[derive(Debug)]
 pub struct TcpTunnelListener {
@@ -45,12 +72,20 @@ impl TcpTunnelListener {
             ),
         };
 
+        // 在分割前保存socket元数据
+        let metadata = Arc::new(TcpTunnelMetadata::new(&stream));
+        
         let (r, w) = stream.into_split();
-        Ok(Box::new(TunnelWrapper::new(
+        let inner = TunnelWrapper::new(
             FramedReader::new(r, TCP_MTU_BYTES),
             FramedWriter::new(w),
             Some(info),
-        )))
+        );
+        
+        Ok(Box::new(TcpTunnel {
+            inner,
+            metadata,
+        }))
     }
 }
 
@@ -123,12 +158,20 @@ fn get_tunnel_with_tcp_stream(
         remote_addr: Some(remote_url.into()),
     };
 
+    // 在分割前保存socket元数据
+    let metadata = Arc::new(TcpTunnelMetadata::new(&stream));
+    
     let (r, w) = stream.into_split();
-    Ok(Box::new(TunnelWrapper::new(
+    let inner = TunnelWrapper::new(
         FramedReader::new(r, TCP_MTU_BYTES),
         FramedWriter::new(w),
         Some(info),
-    )))
+    );
+    
+    Ok(Box::new(TcpTunnel {
+        inner,
+        metadata,
+    }))
 }
 
 #[derive(Debug)]
@@ -296,5 +339,80 @@ mod tests {
         listener.listen().await.unwrap();
         let port = listener.local_url().port().unwrap();
         assert!(port > 0);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_get_metrics() {
+        let mut listener = TcpTunnelListener::new("tcp://127.0.0.1:31016".parse().unwrap());
+        listener.listen().await.unwrap();
+        
+        let mut connector = TcpTunnelConnector::new("tcp://127.0.0.1:31016".parse().unwrap());
+        
+        let (server_tunnel, client_tunnel) = tokio::join!(
+            listener.accept(),
+            connector.connect()
+        );
+        
+        let server_tunnel = server_tunnel.unwrap();
+        let client_tunnel = client_tunnel.unwrap();
+        
+        // 测试get_metrics
+        let metrics = client_tunnel.get_metrics();
+        println!("Client tunnel metrics: {:?}", metrics);
+        
+        let server_metrics = server_tunnel.get_metrics();
+        println!("Server tunnel metrics: {:?}", server_metrics);
+        
+        // 在Linux上应该能获取到metrics
+        #[cfg(target_os = "linux")]
+        {
+            assert!(metrics.is_some());
+            assert!(server_metrics.is_some());
+        }
+    }
+}
+
+/// TCP tunnel 的元数据，用于获取 inflight bytes
+#[derive(Debug, Clone)]
+struct TcpTunnelMetadata {
+    raw_fd: i32,
+}
+
+impl TcpTunnelMetadata {
+    fn new(stream: &TcpStream) -> Self {
+        Self {
+            raw_fd: stream.as_raw_fd(),
+        }
+    }
+    
+    /// 获取TCP socket的发送缓冲区中未确认的字节数（inflight bytes）
+    fn get_inflight_bytes(&self) -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::io::Error;
+            use nix::libc::{c_int, ioctl};
+            
+            // SIOCOUTQ: 获取发送队列中的字节数
+            // 定义见 /usr/include/asm-generic/sockios.h
+            const SIOCOUTQ: u64 = 0x5411;
+            
+            let mut bytes: c_int = 0;
+            let ret = unsafe {
+                ioctl(self.raw_fd, SIOCOUTQ as _, &mut bytes)
+            };
+            
+            if ret == 0 {
+                Some(bytes as u64)
+            } else {
+                tracing::debug!("ioctl SIOCOUTQ failed: {:?}", Error::last_os_error());
+                None
+            }
+        }
+        
+        #[cfg(not(target_os = "linux"))]
+        {
+            // 非Linux系统暂不支持
+            None
+        }
     }
 }
