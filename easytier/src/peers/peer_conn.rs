@@ -40,7 +40,7 @@ use crate::{
         filter::{StatsRecorderTunnelFilter, TunnelFilter, TunnelWithFilter},
         mpsc::{MpscTunnel, MpscTunnelSender},
         packet_def::{PacketType, ZCPacket},
-        stats::{Throughput, WindowLatency},
+        stats::{BandwidthEstimator, WindowLatency, Throughput},
         Tunnel, TunnelError, ZCPacketStream,
     },
 };
@@ -121,6 +121,9 @@ pub struct PeerConn {
     throughput: Arc<Throughput>,
     loss_rate_stats: Arc<AtomicU32>,
 
+    // 新增：独立的带宽估计器，脱离 Throughput
+    bw_estimator: std::sync::Mutex<BandwidthEstimator>,
+
     counters: ArcSwapOption<PeerConnCounter>,
 }
 
@@ -175,6 +178,9 @@ impl PeerConn {
             latency_stats: Arc::new(WindowLatency::new(5)),
             throughput,
             loss_rate_stats: Arc::new(AtomicU32::new(0)),
+
+            // 新增初始化
+            bw_estimator: std::sync::Mutex::new(BandwidthEstimator::new()),
 
             counters: ArcSwapOption::new(None),
         }
@@ -582,6 +588,7 @@ impl PeerConn {
         tunnel_metrics: Option<crate::tunnel::TunnelMetrics>,
     ) -> crate::peers::multipath_scheduler::PathSnapshot {
         use crate::peers::multipath_scheduler::PathSnapshot;
+        use std::sync::atomic::Ordering;
         
         // 获取 srtt (us -> ms)
         let srtt_us = self.latency_stats.get_latency_us::<u32>();
@@ -595,25 +602,41 @@ impl PeerConn {
         let min_rtt_us = self.latency_stats.get_min_rtt_us();
         let min_rtt_ms = (min_rtt_us as f32) / 1000.0;
         
-        // 获取带宽估计 (Bytes/s)
-        let bw_est_bps = self.throughput.get_bw_est_bps();
-        
         // 获取丢包率 (0.0..1.0)
-        // loss_rate_stats 存储的是百分比数值（例如5表示5%），除以100.0转为0-1范围
         let loss_rate = self.loss_rate_stats.load(Ordering::Relaxed) as f32 / 100.0;
+
+        // 就地推进带宽估计：使用 data_tx_bytes 做吞吐增量
+        {
+            let mut est = self.bw_estimator.lock().unwrap();
+            let current_tx_bytes = self.throughput.data_tx_bytes() + self.throughput.data_rx_bytes();
+            let ori_bw = est.get_bw_bps();
+            est.update(
+                current_tx_bytes,
+                srtt_ms as f64,
+                rttvar_ms as f64,
+                min_rtt_ms as f64,
+                loss_rate as f64,
+            );
+            let new_bw = est.get_bw_bps();
+            tracing::info!(
+                "BW estimator update: srtt={:.2}ms rttvar={:.2}ms minrtt={:.2}ms loss={:.4} tx_bytes={} b_hat={:.2}->{:.2} Mbps",
+                srtt_ms, rttvar_ms, min_rtt_ms, loss_rate, current_tx_bytes, ori_bw/1_000_000.0, new_bw/1_000_000.0
+            );
+        }
         
-        // 获取 inflight_bytes
-        // 优先使用 tunnel 层汇报的值（如 TCP），否则通过 Throughput 估算
+        // 读取带宽估计 (Bytes/s)
+        let bw_est_bps = {
+            let est = self.bw_estimator.lock().unwrap();
+            est.get_bw_bps()
+        };
+        
+        // 获取 inflight_bytes（同原逻辑）
         let inflight_bytes = if let Some(metrics) = tunnel_metrics {
-            if let Some(tunnel_inflight) = metrics.inflight_bytes {
-                tunnel_inflight as u32
-            } else {
-                // tunnel 不支持，使用 Throughput 估算，gamma=1.3
+            if let Some(tunnel_inflight) = metrics.inflight_bytes { tunnel_inflight as u32 } else {
                 let srtt_ms_u32 = srtt_ms.max(1.0) as u32;
                 self.throughput.estimated_inflight_bytes(srtt_ms_u32, 1.3) as u32
             }
         } else {
-            // 没有 tunnel metrics，使用 Throughput 估算
             let srtt_ms_u32 = srtt_ms.max(1.0) as u32;
             self.throughput.estimated_inflight_bytes(srtt_ms_u32, 1.3) as u32
         };
@@ -621,17 +644,7 @@ impl PeerConn {
         // 获取 last_tx_age_ms
         let last_tx_age_ms = self.throughput.last_tx_age_ms() as u32;
         
-        PathSnapshot {
-            id: path_id,
-            srtt_ms,
-            rttvar_ms,
-            min_rtt_ms,
-            bw_est_bps,
-            loss_rate,
-            inflight_bytes,
-            last_tx_age_ms,
-            active: true, // 始终为 true
-        }
+        PathSnapshot { id: path_id, srtt_ms, rttvar_ms, min_rtt_ms, bw_est_bps, loss_rate, inflight_bytes, last_tx_age_ms, active: true }
     }
 }
 

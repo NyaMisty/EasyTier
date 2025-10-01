@@ -60,16 +60,16 @@ impl BandwidthEstimator {
             recent_throughput_bps: 0.0,
             
             // 默认参数
-            tau_low: 0.05,      // qnorm ≤ 5% 认为干净
-            tau_high: 0.20,     // qnorm ≥ 20% 认为拥塞
-            p_low: 0.002,       // 0.2% 丢包
-            p_high: 0.01,       // 1% 丢包
-            alpha_per_s: 0.10,  // 每秒最多 +10%
+            tau_low: 0.20,      // qnorm ≤ 20% 认为干净
+            tau_high: 0.60,     // qnorm ≥ 60% 认为拥塞
+            p_low: 0.02,        // 2% 丢包
+            p_high: 0.10,       // 10% 丢包
+            alpha_per_s: 0.20,  // 每秒最多 +20%
             beta: 0.30,         // 拥塞时 ×(1-30%)
             gamma: 0.20,        // 20% EMA 平滑
             headroom: 1.10,     // +10% 余量
-            b_floor: 5.0 * 1_000_000.0,    // 5 Mbps
-            b_cap: 1.0 * 1_000_000_000.0,  // 1 Gbps
+            b_floor: 1.0 * 1_000_000.0,    // 1 MBps
+            b_cap: 40.0 * 1_000_000.0,  // 40 MBps
         }
     }
     
@@ -93,7 +93,7 @@ impl BandwidthEstimator {
         let dt = (now - self.last_update).as_secs_f64();
         
         // 至少间隔 100ms 才更新
-        if dt < 0.1 {
+        if dt < 0.4 {
             return;
         }
         
@@ -126,7 +126,7 @@ impl BandwidthEstimator {
             if minrtt_jump > jump_threshold {
                 // 检测到路径突变，重置估计值
                 self.b_hat = (30.0 * 1_000_000.0 + self.b_hat) / 2.0;
-                tracing::debug!(
+                tracing::info!(
                     "BW estimator: path change detected (minrtt jump {:.2}ms > {:.2}ms), reset b_hat to {:.2} Mbps",
                     minrtt_jump, jump_threshold, self.b_hat / 1_000_000.0
                 );
@@ -139,21 +139,21 @@ impl BandwidthEstimator {
         
         if qnorm <= self.tau_low && loss_rate <= self.p_low {
             // 干净窗口 - 温和上调
-            if throughput > 0.0 {
+            if throughput > self.b_hat { // min 100kb /s
                 // 有流量时才上调
-                let up_cap = self.b_hat * (1.0 + self.alpha_per_s * dt);
-                let target = (throughput * self.headroom).min(up_cap);
+                let up_cap = (self.b_hat * self.alpha_per_s * dt).max(20_000_000.0 * dt);
+                let target = (throughput * self.headroom).min(self.b_hat + up_cap);
                 self.b_hat = ((1.0 - self.gamma) * self.b_hat + self.gamma * target)
                     .clamp(self.b_floor, self.b_cap);
                 
-                tracing::trace!(
+                tracing::info!(
                     "BW estimator: clean window with traffic, qnorm={:.3}, loss={:.4}, throughput={:.2}Mbps, adjust from {:.2} to {:.2} Mbps",
                     qnorm, loss_rate, throughput / 1_000_000.0,
                     old_b_hat / 1_000_000.0, self.b_hat / 1_000_000.0
                 );
             } else {
                 // 零流量时保持不变
-                tracing::trace!(
+                tracing::info!(
                     "BW estimator: clean window but zero traffic, keeping b_hat at {:.2} Mbps",
                     self.b_hat / 1_000_000.0
                 );
@@ -162,8 +162,8 @@ impl BandwidthEstimator {
             // 中性窗口 - 保持/微调
             let target = self.b_hat.max(throughput);
             self.b_hat = (1.0 - self.gamma) * self.b_hat + self.gamma * target;
-            
-            tracing::trace!(
+
+            tracing::info!(
                 "BW estimator: neutral window, qnorm={:.3}, loss={:.4}, hold at {:.2} Mbps",
                 qnorm, loss_rate, self.b_hat / 1_000_000.0
             );
@@ -176,7 +176,7 @@ impl BandwidthEstimator {
             self.b_hat = (self.b_hat.max(throughput) * (1.0 - self.beta * g))
                 .max(self.b_floor);
             
-            tracing::debug!(
+            tracing::info!(
                 "BW estimator: congestion detected, qnorm={:.3}, loss={:.4}, g={:.3}, down from {:.2} to {:.2} Mbps",
                 qnorm, loss_rate, g,
                 old_b_hat / 1_000_000.0, self.b_hat / 1_000_000.0
@@ -381,9 +381,7 @@ impl TimeBucketInFlight {
             self.buckets[self.head] = 0; // 新时间桶清零
         }
         // 如果一次跨过超过 n 个桶，相当于窗口全过期，直接清空
-        if slots_advanced >= n {
-            self.buckets.fill(0);
-        }
+        if slots_advanced >= n { self.buckets.fill(0); }
         self.last_tick += Duration::from_millis((slots_advanced as u64) * self.slot_ms as u64);
     }
 }
@@ -405,9 +403,6 @@ pub struct Throughput {
     last_rx: UnsafeCell<u64>,
 
     inflight: UnsafeCell<TimeBucketInFlight>,
-    
-    // 被动带宽估计器
-    bw_estimator: UnsafeCell<BandwidthEstimator>,
     
     // 最近2s流量统计（用于multipath的flow_bytes_sent）
     recent_tx_bytes: UnsafeCell<u64>,  // 最近2s发送的字节数
@@ -438,8 +433,6 @@ impl Clone for Throughput {
 
             inflight: UnsafeCell::new(TimeBucketInFlight::new(10, 256)),
             
-            bw_estimator: UnsafeCell::new(unsafe { (*self.bw_estimator.get()).clone() }),
-
             recent_tx_bytes: UnsafeCell::new(unsafe { *self.recent_tx_bytes.get() }),
             recent_tx_window_start: UnsafeCell::new(unsafe { *self.recent_tx_window_start.get() }),
             
@@ -472,8 +465,6 @@ impl Default for Throughput {
             
             inflight: UnsafeCell::new(TimeBucketInFlight::new(10, 256)),
             
-            bw_estimator: UnsafeCell::new(BandwidthEstimator::new()),
-
             recent_tx_bytes: UnsafeCell::new(0),
             recent_tx_window_start: UnsafeCell::new(now),
             
@@ -531,56 +522,13 @@ impl Throughput {
         unsafe { (*self.inflight.get()).estimate_inflight(srtt_ms, gamma) }
     }
     
-    /// 更新带宽估计（被动观测法）
-    /// 
-    /// # 参数
-    /// - `srtt_ms`: 平滑 RTT (毫秒)
-    /// - `rttvar_ms`: RTT 方差 (毫秒)
-    /// - `minrtt_ms`: 最小 RTT (毫秒)
-    /// - `loss_rate`: 丢包率 (0.0..1.0)
-    pub fn update_bw_estimate(
-        &self,
-        srtt_ms: f64,
-        rttvar_ms: f64,
-        minrtt_ms: f64,
-        loss_rate: f64,
-    ) {
-        unsafe {
-            let current_tx_bytes = *self.data_tx_bytes.get();
-            (*self.bw_estimator.get()).update(
-                current_tx_bytes,
-                srtt_ms,
-                rttvar_ms,
-                minrtt_ms,
-                loss_rate,
-            );
-        }
-    }
-    
-    /// 获取带宽估计值（Bytes/s）
-    pub fn get_bw_est_bps(&self) -> f64 {
-        unsafe { (*self.bw_estimator.get()).get_bw_bps() }
-    }
-    
-    /// 获取最近的实际吞吐（Bytes/s）
-    pub fn get_recent_throughput_bps(&self) -> f64 {
-        unsafe { (*self.bw_estimator.get()).get_recent_throughput_bps() }
-    }
-    
     /// 获取最近2秒发送的字节数（用于multipath的flow_bytes_sent）
     pub fn get_recent_tx_bytes(&self) -> u64 {
         unsafe {
             let now = Instant::now();
             let window_start = *self.recent_tx_window_start.get();
             let elapsed = (now - window_start).as_secs();
-            
-            // 如果超过2秒，重置窗口
-            if elapsed >= 2 {
-                *self.recent_tx_window_start.get() = now;
-                *self.recent_tx_bytes.get() = 0;
-                return 0;
-            }
-            
+            if elapsed >= 2 { *self.recent_tx_window_start.get() = now; *self.recent_tx_bytes.get() = 0; return 0; }
             *self.recent_tx_bytes.get()
         }
     }
@@ -591,14 +539,7 @@ impl Throughput {
             let now = Instant::now();
             let window_start = *self.recent_rx_window_start.get();
             let elapsed = (now - window_start).as_secs();
-            
-            // 如果超过2秒，重置窗口
-            if elapsed >= 2 {
-                *self.recent_rx_window_start.get() = now;
-                *self.recent_rx_bytes.get() = 0;
-                return 0;
-            }
-            
+            if elapsed >= 2 { *self.recent_rx_window_start.get() = now; *self.recent_rx_bytes.get() = 0; return 0; }
             *self.recent_rx_bytes.get()
         }
     }
@@ -657,56 +598,42 @@ mod tests {
     #[test]
     fn test_throughput_bw_estimate() {
         let throughput = Throughput::new();
+        let mut est = BandwidthEstimator::new();
         
         // 初始带宽应该是30 Mbps
-        let initial_bw = throughput.get_bw_est_bps();
+        let initial_bw = est.get_bw_bps();
         println!("Initial bw_est: {:.2} Mbps", initial_bw / 1_000_000.0);
         assert_eq!(initial_bw, 30.0 * 1_000_000.0, "初始带宽应该是30 Mbps");
         
         // 模拟发送 1MB 数据
-        for _ in 0..100 {
-            throughput.record_tx_bytes(10_000, true); // 每次10KB，is_data=true
-        }
+        for _ in 0..100 { throughput.record_tx_bytes(10_000, true); }
         
         // 等待100ms
         thread::sleep(Duration::from_millis(100));
         
         // 第一次更新带宽估计 (干净窗口: qnorm=0.25, loss=0)
         // srtt=50ms, minrtt=40ms -> qnorm = (50-40)/40 = 0.25 (中性窗口)
-        throughput.update_bw_estimate(50.0, 10.0, 40.0, 0.0);
-        let bw1 = throughput.get_bw_est_bps();
-        let thr1 = throughput.get_recent_throughput_bps();
-        println!("After 100ms: bw_est={:.2} Mbps, throughput={:.2} Mbps", 
-            bw1 / 1_000_000.0, thr1 / 1_000_000.0);
+        est.update(throughput.data_tx_bytes(), 50.0, 10.0, 40.0, 0.0);
+        let bw1 = est.get_bw_bps();
+        let thr1 = est.get_recent_throughput_bps();
+        println!("After 100ms: bw_est={:.2} Mbps, throughput={:.2} Mbps", bw1 / 1_000_000.0, thr1 / 1_000_000.0);
         
-        // 实际吞吐约为 1MB / 0.1s = 10MB/s
-        // 在中性窗口下，带宽估计应该接近实际吞吐或保持
         assert!(bw1 > 0.0, "带宽估计应该大于0");
         assert!(thr1 > 5_000_000.0, "吞吐应该约10MB/s");
         
         // 再发送500KB
-        for _ in 0..50 {
-            throughput.record_tx_bytes(10_000, true);
-        }
+        for _ in 0..50 { throughput.record_tx_bytes(10_000, true); }
         
         // 再等待100ms
         thread::sleep(Duration::from_millis(100));
         
         // 第二次更新 (干净窗口: qnorm=0.025, loss=0)
-        // srtt=41ms, minrtt=40ms -> qnorm = (41-40)/40 = 0.025 < 0.05 (干净窗口)
-        throughput.update_bw_estimate(41.0, 5.0, 40.0, 0.0);
-        let bw2 = throughput.get_bw_est_bps();
-        let thr2 = throughput.get_recent_throughput_bps();
-        println!("After another 100ms: bw_est={:.2} Mbps, throughput={:.2} Mbps", 
-            bw2 / 1_000_000.0, thr2 / 1_000_000.0);
+        est.update(throughput.data_tx_bytes(), 41.0, 5.0, 40.0, 0.0);
+        let bw2 = est.get_bw_bps();
+        let thr2 = est.get_recent_throughput_bps();
+        println!("After another 100ms: bw_est={:.2} Mbps, throughput={:.2} Mbps", bw2 / 1_000_000.0, thr2 / 1_000_000.0);
         
-        // 在干净窗口下，有流量时应该朝吞吐方向调整
-        // 由于第二次吞吐较低（500KB/100ms = 5MB/s），带宽估计会被拉低
-        // 但应该在合理范围内
-        assert!(bw2 > 0.0 && bw2 < 50.0 * 1_000_000.0, 
-            "带宽估计应该在合理范围内: {:.2} Mbps", bw2 / 1_000_000.0);
-        
-        // 验证累计字节数
+        assert!(bw2 > 0.0 && bw2 < 50.0 * 1_000_000.0, "带宽估计应该在合理范围内: {:.2} Mbps", bw2 / 1_000_000.0);
         assert_eq!(throughput.data_tx_bytes(), 1_500_000, "总共发送了1.5MB");
     }
     
@@ -738,9 +665,7 @@ mod tests {
         let throughput = Throughput::new();
         
         // 发送一些数据
-        for _ in 0..10 {
-            throughput.record_tx_bytes(1500, true);
-        }
+        for _ in 0..10 { throughput.record_tx_bytes(1500, true); }
         
         // 估算 in-flight（假设 RTT 50ms）
         let inflight = throughput.estimated_inflight_bytes(50, 1.5);
@@ -751,47 +676,42 @@ mod tests {
     #[test]
     fn test_bw_estimate_with_zero_traffic() {
         let throughput = Throughput::new();
+        let mut est = BandwidthEstimator::new();
         
-        let bw_before = throughput.get_bw_est_bps();
+        let bw_before = est.get_bw_bps();
         println!("Before update: {:.2} Mbps", bw_before / 1_000_000.0);
         
         // 不发送任何数据，直接更新带宽
         thread::sleep(Duration::from_millis(100));
         // qnorm=(50-40)/40=0.25，属于中性窗口
-        throughput.update_bw_estimate(50.0, 10.0, 40.0, 0.0);
+        est.update(throughput.data_tx_bytes(), 50.0, 10.0, 40.0, 0.0);
         
-        let bw_after = throughput.get_bw_est_bps();
-        let thr = throughput.get_recent_throughput_bps();
-        println!("After update: bw={:.2} Mbps, throughput={:.2} Mbps", 
-            bw_after / 1_000_000.0, thr / 1_000_000.0);
+        let bw_after = est.get_bw_bps();
+        let thr = est.get_recent_throughput_bps();
+        println!("After update: bw={:.2} Mbps, throughput={:.2} Mbps", bw_after / 1_000_000.0, thr / 1_000_000.0);
         
         // 零流量时应该接近初始值（允许小幅波动）
-        assert!((bw_after - 30.0 * 1_000_000.0).abs() < 1_000_000.0, 
-            "零流量时应保持接近初始带宽，expected=30Mbps, actual={:.2}Mbps", 
-            bw_after / 1_000_000.0);
+        assert!((bw_after - 30.0 * 1_000_000.0).abs() < 1_000_000.0, "零流量时应保持接近初始带宽，expected=30Mbps, actual={:.2}Mbps", bw_after / 1_000_000.0);
     }
     
     #[test]
     fn test_bw_estimate_congestion() {
         let throughput = Throughput::new();
+        let mut est = BandwidthEstimator::new();
         
         // 第一次：发送1MB，100ms，干净窗口
-        for _ in 0..100 {
-            throughput.record_tx_bytes(10_000, true);
-        }
+        for _ in 0..100 { throughput.record_tx_bytes(10_000, true); }
         thread::sleep(Duration::from_millis(100));
-        throughput.update_bw_estimate(41.0, 5.0, 40.0, 0.0);  // qnorm=0.025，干净
-        let bw1 = throughput.get_bw_est_bps();
+        est.update(throughput.data_tx_bytes(), 41.0, 5.0, 40.0, 0.0);  // qnorm=0.025，干净
+        let bw1 = est.get_bw_bps();
         println!("BW1 (clean): {:.2} Mbps", bw1 / 1_000_000.0);
         
         // 第二次：发送100KB，100ms，但检测到拥塞
-        for _ in 0..10 {
-            throughput.record_tx_bytes(10_000, true);
-        }
+        for _ in 0..10 { throughput.record_tx_bytes(10_000, true); }
         thread::sleep(Duration::from_millis(100));
         // srtt=60ms, minrtt=40ms -> qnorm = (60-40)/40 = 0.5 > 0.2 (拥塞)
-        throughput.update_bw_estimate(60.0, 15.0, 40.0, 0.005);
-        let bw2 = throughput.get_bw_est_bps();
+        est.update(throughput.data_tx_bytes(), 60.0, 15.0, 40.0, 0.005);
+        let bw2 = est.get_bw_bps();
         println!("BW2 (congestion): {:.2} Mbps", bw2 / 1_000_000.0);
         
         // 拥塞时应该下调
@@ -801,37 +721,26 @@ mod tests {
     #[test]
     fn test_bw_estimate_path_change() {
         let throughput = Throughput::new();
+        let mut est = BandwidthEstimator::new();
         
         // 发送一些数据
-        for _ in 0..100 {
-            throughput.record_tx_bytes(10_000, true);
-        }
+        for _ in 0..100 { throughput.record_tx_bytes(10_000, true); }
         thread::sleep(Duration::from_millis(100));
         
         // 第一次更新 (minrtt=40ms)
-        throughput.update_bw_estimate(50.0, 10.0, 40.0, 0.0);
-        let bw1 = throughput.get_bw_est_bps();
+        est.update(throughput.data_tx_bytes(), 50.0, 10.0, 40.0, 0.0);
+        let bw1 = est.get_bw_bps();
         println!("BW1: {:.2} Mbps (minrtt=40ms)", bw1 / 1_000_000.0);
         
         // 再发送一些数据
-        for _ in 0..50 {
-            throughput.record_tx_bytes(10_000, true);
-        }
+        for _ in 0..50 { throughput.record_tx_bytes(10_000, true); }
         thread::sleep(Duration::from_millis(100));
         
-        // 模拟路径切换 (minrtt从40ms突变到120ms，差值80ms > 3*20ms=60ms)
-        // rttvar=20ms，所以阈值是max(60ms, 20ms) = 60ms
-        // 80ms > 60ms，应该触发路径突变保护
-        throughput.update_bw_estimate(130.0, 20.0, 120.0, 0.0);
-        let bw2 = throughput.get_bw_est_bps();
-        let thr = throughput.get_recent_throughput_bps();
-        println!("BW2 (after path change): {:.2} Mbps (minrtt=120ms, throughput={:.2}Mbps)", 
-            bw2 / 1_000_000.0, thr / 1_000_000.0);
-        
-        // 路径突变应该首先重置带宽，然后根据拥塞状态调整
-        // qnorm = (130-120)/120 = 0.083，属于中性窗口
-        // 所以重置后不会再大幅调整
-        // 验证带宽发生了明显变化（可能上升也可能下降，取决于新吞吐）
+        // 模拟路径切换 (minrtt从40ms突变到120ms)
+        est.update(throughput.data_tx_bytes(), 130.0, 20.0, 120.0, 0.0);
+        let bw2 = est.get_bw_bps();
+        let thr = est.get_recent_throughput_bps();
+        println!("BW2 (after path change): {:.2} Mbps (minrtt=120ms, throughput={:.2}Mbps)", bw2 / 1_000_000.0, thr / 1_000_000.0);
         println!("BW change: from {:.2} to {:.2} Mbps", bw1 / 1_000_000.0, bw2 / 1_000_000.0);
         assert!(bw2 > 0.0 && bw2 != bw1, "路径突变后带宽应该有所变化");
     }

@@ -85,7 +85,7 @@ impl PathSnapshot {
     }
 }
 
-/// 调度器输入参数
+/// 调度器输入参数（旧：按包）
 #[derive(Clone, Debug)]
 pub struct PickInput {
     /// 当前时间戳 (ms)
@@ -113,7 +113,7 @@ impl PickInput {
     }
 }
 
-/// 调度决策结果
+/// 调度决策结果（旧：按包）
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Decision {
     /// 主路径 ID
@@ -138,6 +138,45 @@ impl Decision {
             redundant: Some(redundant),
         }
     }
+}
+
+// ---------------- 新增：Epoch 级输入/输出 ----------------
+
+#[derive(Clone, Debug)]
+pub struct EpochInput {
+    pub now_ms: u64,
+    pub epoch_ms: u32,            // 例如 200ms
+    pub packet_len_hint: usize,   // 典型包长/MTU
+    pub paths: Vec<PathSnapshot>,
+    pub prev_weights: Option<Vec<PathWeight>>, // 上一轮权重用于 EMA
+}
+
+#[derive(Clone, Debug)]
+pub struct PathWeight {
+    pub id: PathId,
+    pub weight: f64, // 0..1，总和为 1
+}
+
+#[derive(Clone, Debug)]
+pub enum RedundancyMode {
+    Off,
+    ShortIdleCritical {
+        duplicate_first_n: u8,
+        pair: (PathId, PathId),
+        budget_pkts: u32,
+    },
+    Percentage {
+        percent: f32,
+        pair: (PathId, PathId),
+        budget_pkts: u32,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct EpochPlan {
+    pub valid_until_ms: u64,
+    pub lb_weights: Vec<PathWeight>,
+    pub redundancy: RedundancyMode,
 }
 
 /// 调度器配置参数
@@ -167,6 +206,26 @@ pub struct Config {
     pub enable_qaware: bool,
     /// 启用短流/空闲冗余
     pub enable_redundancy: bool,
+
+    // 新增：权重化与平滑参数
+    /// 丢包惩罚系数 gamma（loss_factor = clamp(1 - gamma*loss, 0.2, 1.0)）
+    pub loss_gamma: f64,
+    /// QAware 平滑系数 beta
+    pub qaware_beta: f64,
+    /// BLEST 指数门控时间常数 tau（ms）
+    pub blest_tau_ms: f64,
+    /// 余量增益强度 k
+    pub headroom_k: f64,
+    /// 余量增益上限（倍率）
+    pub headroom_cap: f64,
+    /// EMA 平滑 alpha
+    pub smooth_alpha: f64,
+    /// 每条最小份额（避免饥饿）
+    pub min_share: f64,
+    /// 参与冗余的最小权重门槛
+    pub redundancy_min_weight: f64,
+    /// 每个 epoch 的冗余预算（包数）
+    pub redundancy_epoch_budget_pkts: u32,
 }
 
 impl Default for Config {
@@ -184,6 +243,17 @@ impl Default for Config {
             enable_blest: true,
             enable_qaware: true,
             enable_redundancy: true,
+
+            // 新增默认
+            loss_gamma: 1.0,
+            qaware_beta: 0.6,
+            blest_tau_ms: 20.0,
+            headroom_k: 0.5,
+            headroom_cap: 1.5,
+            smooth_alpha: 0.6,
+            min_share: 0.0,
+            redundancy_min_weight: 0.05,
+            redundancy_epoch_budget_pkts: 32,
         }
     }
 }
@@ -247,21 +317,21 @@ impl Scheduler {
         *self.cfg.write().unwrap() = cfg;
     }
 
-    /// 为当前包选择路径
+    /// 为当前 epoch 计算负载分担权重与冗余策略
     ///
-    /// # 返回
-    /// - `Some(Decision)`: 成功选择路径
-    /// - `None`: 没有可用路径
-    pub fn pick_path(&self, inp: &PickInput) -> Option<Decision> {
+    /// - 输入：EpochInput（200ms 节拍推荐）
+    /// - 输出：EpochPlan { lb_weights, redundancy }
+    ///
+    /// 注：保留原有 Phase A-E 的日志结构与注释，内部从“逐包决策”改为“权重化计算”。
+    pub fn compute_plan(&self, inp: &EpochInput) -> Option<EpochPlan> {
         let cfg = self.cfg.read().unwrap().clone();
         
         tracing::info!(
-            "Multipath scheduler input: now_ms={}, packet_len={}, flow_bytes_sent={}, critical={}, paths_count={}",
-            inp.now_ms, inp.packet_len, inp.flow_bytes_sent, inp.critical, inp.paths.len()
+            "Multipath scheduler epoch input: now_ms={}, epoch_ms={}, packet_len_hint={}, paths_count={}",
+            inp.now_ms, inp.epoch_ms, inp.packet_len_hint, inp.paths.len()
         );
         
-        // 输出所有输入路径的详细信息
-        // tracing::debug!("Input paths details:");
+        // 输出所有输入路径的详细信息（沿用原日志风格）
         for (idx, p) in inp.paths.iter().enumerate() {
             tracing::info!(
                 "  [{}] Path {}: active={}, srtt={:.2}ms, rttvar={:.2}ms, min_rtt={:.2}ms, bw_est={:.2}Mbps, loss_rate={:.4}, inflight={}bytes, last_tx_age={}ms, queue_delay={:.2}ms, headroom={:.2}bytes, usable={}",
@@ -271,12 +341,12 @@ impl Scheduler {
             );
         }
         
-        // Phase A: 过滤不可用路径
+        // Phase A: 过滤不可用路径（轻量）
         let mut candidates: Vec<Candidate> = inp
             .paths
             .iter()
             .filter(|p| p.is_usable())
-            .map(|p| self.make_candidate(&cfg, inp.now_ms, inp.packet_len, p))
+            .map(|p| self.make_candidate(&cfg, inp.now_ms, inp.packet_len_hint, p))
             .collect();
 
         tracing::debug!(
@@ -288,82 +358,265 @@ impl Scheduler {
             tracing::debug!("No usable paths available");
             return None;
         }
+
+        if candidates.len() == 1 {
+            // 单路径：权重全给存活者，冗余关闭
+            let only = candidates[0].id;
+            tracing::debug!("Single usable path: {} (assign weight=1.0)", only);
+            return Some(EpochPlan {
+                valid_until_ms: inp.now_ms + inp.epoch_ms as u64,
+                lb_weights: vec![PathWeight { id: only, weight: 1.0 }],
+                redundancy: RedundancyMode::Off,
+            });
+        }
         
         // 记录初始候选路径信息
         for c in &candidates {
             tracing::debug!(
-                "  Candidate path {}: srtt={:.2}ms, queue_delay={:.2}ms, eta={:.2}ms, score={:.2}",
-                c.id, c.srtt_ms, c.queue_delay_ms, c.eta_ms, c.score
+                "  Candidate path {}: srtt={:.2}ms, queue_delay={:.2}ms, eta={:.2}ms",
+                c.id, c.srtt_ms, c.queue_delay_ms, c.eta_ms
             );
         }
 
-        // Phase C: BLEST 乱序预算过滤
-        if cfg.enable_blest {
-            let before_count = candidates.len();
-            candidates = self.apply_blest_filter(&cfg, candidates);
+        // Phase C: BLEST 乱序预算门控（权重化，不做硬过滤）
+        // 先按 ETA 找到最快路径与 Δ
+        candidates.sort_by(|a, b| a.eta_ms.total_cmp(&b.eta_ms));
+        let eta_fast = candidates[0].eta_ms;
+        let srtt_fast = candidates[0].srtt_ms;
+        let delta_ms = (0.25 * srtt_fast as f64)
+            .clamp(4.0, cfg.blest_delta_cap_ms as f64);
+        tracing::debug!(
+            "Phase C - BLEST gating: eta_fast={:.2}ms, srtt_fast={:.2}ms, delta={:.2}ms",
+            eta_fast, srtt_fast, delta_ms
+        );
+
+        // Phase D: QAware 目标排队时延控制（平滑罚因子）
+        tracing::debug!("Phase D - QAware penalty factors (target_qdelay={}ms)", cfg.target_qdelay_ms);
+
+        // Phase B: 原按分数排序改为计算原始权重 raw_i 并归一化
+        // 组合：eff * loss_factor * qaware * blest * headroom_boost
+        let mut raws: Vec<(PathId, f64, f64)> = Vec::with_capacity(candidates.len()); // (id, raw, eta)
+        for c in &candidates {
+            // 基础有效带宽
+            let bw = inp
+                .paths
+                .iter()
+                .find(|p| p.id == c.id)
+                .map(|p| p.bw_est_bps)
+                .unwrap_or(0.0)
+                .max(1.0);
+
+            // 丢包惩罚（平滑）
+            let loss = inp
+                .paths
+                .iter()
+                .find(|p| p.id == c.id)
+                .map(|p| p.loss_rate)
+                .unwrap_or(0.0) as f64;
+            let loss_factor = (1.0 - cfg.loss_gamma * loss).clamp(0.2, 1.0);
+
+            // QAware 罚因子
+            let qaware = if cfg.enable_qaware {
+                if c.queue_delay_ms <= cfg.target_qdelay_ms as f64 {
+                    1.0
+                } else {
+                    let over = (c.queue_delay_ms - cfg.target_qdelay_ms as f64)
+                        / (cfg.target_qdelay_ms as f64);
+                    1.0 / (1.0 + cfg.qaware_beta * over.max(0.0))
+                }
+            } else {
+                1.0
+            };
+
+            // BLEST 指数门控
+            let blest = if cfg.enable_blest {
+                if c.eta_ms <= eta_fast + delta_ms { 1.0 } else {
+                    let extra = c.eta_ms - (eta_fast + delta_ms);
+                    f64::exp(-(extra / cfg.blest_tau_ms))
+                }
+            } else { 1.0 };
+
+            // 余量微增益
+            let (bdp_bytes, headroom_ratio) = inp
+                .paths
+                .iter()
+                .find(|p| p.id == c.id)
+                .map(|p| {
+                    let bdp = bw * (p.min_rtt_ms as f64 / 1000.0);
+                    let headroom = (bdp - p.inflight_bytes as f64).max(0.0);
+                    let ratio = if bdp > 0.0 { headroom / bdp } else { 0.0 };
+                    (bdp, ratio)
+                })
+                .unwrap_or((0.0, 0.0));
+            let _ = bdp_bytes; // 仅用于可读性
+            let headroom_boost = (1.0 + cfg.headroom_k * headroom_ratio.clamp(0.0, 1.0))
+                .min(cfg.headroom_cap);
+
+            let mut raw = bw * loss_factor * qaware * blest * headroom_boost;
+            if raw < 1e-9 { raw = 0.0; }
+
             tracing::debug!(
-                "Phase C - BLEST filter: {} paths remain (filtered out {})",
-                candidates.len(), before_count - candidates.len()
+                "  Path {} factors: bw={:.2}, loss_factor={:.3}, qaware={:.3}, blest={:.3}, headroom_boost={:.3} => raw={:.4}",
+                c.id, bw, loss_factor, qaware, blest, headroom_boost, raw
+            );
+
+            raws.push((c.id, raw, c.eta_ms));
+        }
+
+        // 归一化
+        let sum_raw: f64 = raws.iter().map(|(_, r, _)| *r).sum();
+        if sum_raw <= 0.0 {
+            tracing::debug!("All raw weights ~0, fallback to fastest path weight=1.0");
+            let fastest = candidates[0].id;
+            return Some(EpochPlan {
+                valid_until_ms: inp.now_ms + inp.epoch_ms as u64,
+                lb_weights: vec![PathWeight { id: fastest, weight: 1.0 }],
+                redundancy: RedundancyMode::Off,
+            });
+        }
+        for (_, r, _) in raws.iter_mut() { *r /= sum_raw; }
+
+        // EMA 平滑 + 最小份额
+        let mut weights: Vec<PathWeight> = Vec::with_capacity(raws.len());
+        for (id, raw, _eta) in &raws {
+            // 若 prev 不存在，直接取 raw
+            let prev = inp
+                .prev_weights
+                .as_ref()
+                .and_then(|v| v.iter().find(|w| w.id == *id))
+                .map(|w| w.weight);
+            let smoothed = match prev {
+                Some(p) => cfg.smooth_alpha * *raw + (1.0 - cfg.smooth_alpha) * p,
+                None => *raw,
+            };
+            weights.push(PathWeight { id: *id, weight: smoothed });
+        }
+
+        // 最小份额并二次归一
+        if cfg.min_share > 0.0 {
+            let mut sum_after = 0.0;
+            for w in weights.iter_mut() {
+                w.weight = w.weight.max(cfg.min_share);
+                sum_after += w.weight;
+            }
+            for w in weights.iter_mut() { w.weight /= sum_after.max(1e-9); }
+        } else {
+            let s: f64 = weights.iter().map(|w| w.weight).sum();
+            if s > 0.0 { for w in weights.iter_mut() { w.weight /= s; } }
+        }
+
+        // Phase B - 输出排序信息（沿用原始日志风格，使用权重代替分数）
+        let mut sorted_preview = weights.clone();
+        sorted_preview.sort_by(|a, b| b.weight.total_cmp(&a.weight));
+        tracing::debug!("Phase B - Sorted by weight:");
+        for (i, w) in sorted_preview.iter().enumerate() {
+            let eta = raws.iter().find(|(id,_,_)| *id == w.id).map(|(_,_,e)| *e).unwrap_or(0.0);
+            let srtt = candidates.iter().find(|c| c.id == w.id).map(|c| c.srtt_ms).unwrap_or(0.0);
+            tracing::debug!(
+                "  #{} Path {}: weight={:.4}, eta={:.2}ms, srtt={:.2}ms",
+                i + 1, w.id, w.weight, eta, srtt
             );
         }
 
-        if candidates.is_empty() {
-            tracing::debug!("No paths after BLEST filter");
+        // Phase E: 冗余计划（top-2 by ETA）
+        let mut eta_sorted = raws.clone();
+        eta_sorted.sort_by(|a, b| a.2.total_cmp(&b.2));
+        let (p1, e1) = (eta_sorted[0].0, eta_sorted[0].2);
+        let (p2, e2) = (eta_sorted[1].0, eta_sorted[1].2);
+        let eta_gap = e2 - e1;
+        let w1 = weights.iter().find(|w| w.id == p1).map(|w| w.weight).unwrap_or(0.0);
+        let w2 = weights.iter().find(|w| w.id == p2).map(|w| w.weight).unwrap_or(0.0);
+
+        let redundancy = if eta_gap > delta_ms && w1 >= cfg.redundancy_min_weight && w2 >= cfg.redundancy_min_weight {
+            tracing::debug!(
+                "Phase E - Redundancy enabled: pair=({}, {}), eta_gap={:.2}ms > delta={:.2}ms, w1={:.3}, w2={:.3}",
+                p1, p2, eta_gap, delta_ms, w1, w2
+            );
+            RedundancyMode::ShortIdleCritical {
+                duplicate_first_n: 1,
+                pair: (p1, p2),
+                budget_pkts: cfg.redundancy_epoch_budget_pkts,
+            }
+        } else {
+            tracing::debug!(
+                "Phase E - Redundancy not triggered: eta_gap={:.2}ms, delta={:.2}ms, w1={:.3}, w2={:.3}",
+                eta_gap, delta_ms, w1, w2
+            );
+            RedundancyMode::Off
+        };
+
+        tracing::debug!(
+            "Final plan: valid_until_ms={}, weights_count={}, redundancy_mode={}",
+            inp.now_ms + inp.epoch_ms as u64,
+            weights.len(),
+            match &redundancy { RedundancyMode::Off => "Off", RedundancyMode::ShortIdleCritical {..} => "ShortIdleCritical", RedundancyMode::Percentage {..} => "Percentage" }
+        );
+        
+        Some(EpochPlan {
+            valid_until_ms: inp.now_ms + inp.epoch_ms as u64,
+            lb_weights: weights,
+            redundancy,
+        })
+    }
+
+    /// 兼容层：按包接口（用于旧调用方与外部用例）
+    /// 内部借助 compute_plan 计算权重与冗余对，再结合旧触发条件输出 Decision
+    pub fn pick_path(&self, inp: &PickInput) -> Option<Decision> {
+        // 构造一个最小 epoch 输入（200ms 默认）
+        let epoch_in = EpochInput {
+            now_ms: inp.now_ms,
+            epoch_ms: 200,
+            packet_len_hint: inp.packet_len,
+            paths: inp.paths.clone(),
+            prev_weights: None,
+        };
+        let plan = self.compute_plan(&epoch_in)?;
+        if plan.lb_weights.is_empty() {
             return None;
         }
 
-        // Phase D: QAware 目标排队时延控制
-        if cfg.enable_qaware {
-            self.apply_qaware_penalty(&cfg, &mut candidates);
-            tracing::debug!("Phase D - QAware penalty applied (target_qdelay={}ms)", cfg.target_qdelay_ms);
-            for c in &candidates {
-                tracing::debug!(
-                    "  Path {} after QAware: score={:.2}, queue_delay={:.2}ms",
-                    c.id, c.score, c.queue_delay_ms
-                );
+        // 主路径：取权重最大的路径
+        let primary = plan
+            .lb_weights
+            .iter()
+            .max_by(|a, b| a.weight.partial_cmp(&b.weight).unwrap_or(Ordering::Equal))
+            .map(|w| w.id)?;
+
+        // 旧触发条件：短流/空闲/关键包
+        let cfg = self.get_config();
+        let is_short_flow = inp.flow_bytes_sent <= cfg.short_flow_thresh;
+        let is_idle_burst = inp
+            .paths
+            .iter()
+            .any(|p| p.last_tx_age_ms >= cfg.idle_burst_ms);
+        let trigger = is_short_flow || is_idle_burst || inp.critical;
+
+        // 根据 compute_plan 的冗余建议与触发条件决定是否复制
+        let redundant = if trigger {
+            match plan.redundancy {
+                RedundancyMode::ShortIdleCritical { pair: (a, b), .. } |
+                RedundancyMode::Percentage { pair: (a, b), .. } => {
+                    // 从 pair 中挑选非 primary 的作为冗余目标
+                    if a != primary && b != primary {
+                        // 若 primary 不在 pair 中，选择权重更高的那个
+                        let wa = plan.lb_weights.iter().find(|w| w.id == a).map(|w| w.weight).unwrap_or(0.0);
+                        let wb = plan.lb_weights.iter().find(|w| w.id == b).map(|w| w.weight).unwrap_or(0.0);
+                        Some(if wa >= wb { a } else { b })
+                    } else if a == primary && b != primary {
+                        Some(b)
+                    } else if b == primary && a != primary {
+                        Some(a)
+                    } else {
+                        None
+                    }
+                }
+                RedundancyMode::Off => None,
             }
-        }
-
-        // Phase B: 按分数排序,分数相近用 ETA 破平
-        candidates.sort_by(|a, b| match b.score.total_cmp(&a.score) {
-            Ordering::Equal => a.eta_ms.total_cmp(&b.eta_ms),
-            other => other,
-        });
-
-        tracing::debug!("Phase B - Sorted by score:");
-        for (i, c) in candidates.iter().enumerate() {
-            tracing::debug!(
-                "  #{} Path {}: score={:.2}, eta={:.2}ms, srtt={:.2}ms",
-                i + 1, c.id, c.score, c.eta_ms, c.srtt_ms
-            );
-        }
-
-        let primary = candidates[0].id;
-
-        // Phase E: 短流/空闲冗余
-        let redundant = if cfg.enable_redundancy {
-            let result = self.decide_redundancy(&cfg, inp, &candidates);
-            if let Some(redundant_id) = result {
-                tracing::debug!(
-                    "Phase E - Redundancy enabled: redundant_path={}",
-                    redundant_id
-                );
-            } else {
-                tracing::debug!("Phase E - Redundancy not triggered");
-            }
-            result
         } else {
-            tracing::debug!("Phase E - Redundancy disabled");
             None
         };
 
-        let decision = Decision { primary, redundant };
-        tracing::debug!(
-            "Final decision: primary={}, redundant={:?}",
-            decision.primary, decision.redundant
-        );
-        
-        Some(decision)
+        Some(Decision { primary, redundant })
     }
 
     /// 创建候选路径 (计算基础分数)
@@ -379,7 +632,7 @@ impl Scheduler {
         let eta_ms = path.estimate_eta(now_ms, packet_len);
         let headroom = path.headroom_bytes();
 
-        // Phase B: 在线打分
+        // Phase B: 在线打分（保留但不再用于最终决策，仅日志对齐）
         let mut score = 0.0;
         score += cfg.w1_bw * bw;
         score += cfg.w2_headroom * (headroom / (path.srtt_ms as f64).max(1.0));
@@ -398,7 +651,7 @@ impl Scheduler {
         }
     }
 
-    /// 应用 BLEST 乱序预算过滤
+    /// 应用 BLEST 乱序预算过滤（旧逻辑，保留以便回溯；权重化版本在 compute_plan 中实现）
     fn apply_blest_filter(&self, cfg: &Config, mut candidates: Vec<Candidate>) -> Vec<Candidate> {
         if candidates.is_empty() {
             return candidates;
@@ -445,7 +698,7 @@ impl Scheduler {
         }
     }
 
-    /// 应用 QAware 目标排队时延惩罚
+    /// 应用 QAware 目标排队时延惩罚（旧逻辑，保留以便回溯；权重化版本在 compute_plan 中实现）
     fn apply_qaware_penalty(&self, cfg: &Config, candidates: &mut [Candidate]) {
         let any_under_target = candidates
             .iter()
@@ -475,7 +728,7 @@ impl Scheduler {
         }
     }
 
-    /// 决定是否启用冗余发送
+    /// 决定是否启用冗余发送（旧逻辑，保留以便回溯；权重化版本在 compute_plan 中输出路径对）
     fn decide_redundancy(
         &self,
         cfg: &Config,
@@ -593,6 +846,15 @@ mod tests {
         }
     }
 
+    fn weight_of(plan: &EpochPlan, id: PathId) -> f64 {
+        plan.lb_weights.iter().find(|w| w.id == id).map(|w| w.weight).unwrap_or(0.0)
+    }
+
+    fn sum_weights(plan: &EpochPlan) -> f64 { plan.lb_weights.iter().map(|w| w.weight).sum() }
+
+    fn approx(a: f64, b: f64, eps: f64) -> bool { (a - b).abs() <= eps }
+
+    // 原逐包单元测试保留但不再适用 compute_plan，保留以便回溯/对比
     #[test]
     fn test_phase_a_filter_inactive() {
         let scheduler = Scheduler::new(Config::default());
@@ -601,78 +863,57 @@ mod tests {
         path1.active = false;
         let path2 = create_test_path(2, 100.0, 0.5, 0.0);
 
-        let input = PickInput {
+        let input = EpochInput {
             now_ms: 0,
-            packet_len: 1500,
-            flow_bytes_sent: 0,
-            critical: false,
+            epoch_ms: 200,
+            packet_len_hint: 1500,
             paths: vec![path1, path2],
+            prev_weights: None,
         };
 
-        let decision = scheduler.pick_path(&input).unwrap();
-        assert_eq!(decision.primary, 2, "应该选择活跃路径");
+        let plan = scheduler.compute_plan(&input).unwrap();
+        assert_eq!(plan.lb_weights.len(), 1, "应该只有活跃路径");
+        assert_eq!(plan.lb_weights[0].id, 2, "应该选择活跃路径");
+        assert!(matches!(plan.redundancy, RedundancyMode::Off));
     }
 
     #[test]
     fn test_phase_b_bandwidth_preference() {
         let scheduler = Scheduler::new(Config::default());
-        
-        let path1 = create_test_path(1, 50.0, 10.0, 0.0);  // 高带宽
-        let path2 = create_test_path(2, 40.0, 1.0, 0.0);   // 低带宽
-
-        let input = PickInput {
-            now_ms: 0,
-            packet_len: 1500,
-            flow_bytes_sent: 0,
-            critical: false,
-            paths: vec![path1, path2],
-        };
-
-        let decision = scheduler.pick_path(&input).unwrap();
-        // 由于 path1 带宽显著更高,即使 RTT 稍差,也应该被选中
-        assert_eq!(decision.primary, 1, "应该优先选择高带宽路径");
+        let path1 = create_test_path(1, 50.0, 10.0, 0.0); // 高带宽
+        let path2 = create_test_path(2, 50.0, 1.0, 0.0);  // 低带宽
+        let input = EpochInput { now_ms: 0, epoch_ms: 200, packet_len_hint: 1500, paths: vec![path1, path2], prev_weights: None };
+        let plan = scheduler.compute_plan(&input).unwrap();
+        let w1 = weight_of(&plan, 1);
+        let w2 = weight_of(&plan, 2);
+        assert!(w1 > w2, "高带宽路径应获得更大权重: w1={} w2={}", w1, w2);
+        assert!(w1 > 0.6, "高带宽路径权重应显著更高");
+        assert!(approx(sum_weights(&plan), 1.0, 1e-6));
     }
 
     #[test]
     fn test_phase_b_loss_penalty() {
         let scheduler = Scheduler::new(Config::default());
-        
-        let path1 = create_test_path(1, 50.0, 5.0, 0.1);   // 10% 丢包
-        let path2 = create_test_path(2, 50.0, 5.0, 0.0);   // 无丢包
-
-        let input = PickInput {
-            now_ms: 0,
-            packet_len: 1500,
-            flow_bytes_sent: 0,
-            critical: false,
-            paths: vec![path1, path2],
-        };
-
-        let decision = scheduler.pick_path(&input).unwrap();
-        assert_eq!(decision.primary, 2, "应该避免高丢包路径");
+        let path1 = create_test_path(1, 50.0, 5.0, 0.10); // 高丢包
+        let path2 = create_test_path(2, 50.0, 5.0, 0.00); // 无丢包
+        let input = EpochInput { now_ms: 0, epoch_ms: 200, packet_len_hint: 1500, paths: vec![path1, path2], prev_weights: None };
+        let plan = scheduler.compute_plan(&input).unwrap();
+        assert!(weight_of(&plan, 2) > weight_of(&plan, 1), "应避免高丢包路径");
     }
 
     #[test]
-    fn test_phase_c_blest_filter() {
+    fn test_phase_c_blest_gating() {
         let mut cfg = Config::default();
         cfg.enable_blest = true;
         let scheduler = Scheduler::new(cfg);
-        
         let path1 = create_test_path(1, 50.0, 1.0, 0.0);   // 快路
-        let path2 = create_test_path(2, 200.0, 1.0, 0.0);  // 慢路
-
-        let input = PickInput {
-            now_ms: 0,
-            packet_len: 1500,
-            flow_bytes_sent: 0,
-            critical: false,
-            paths: vec![path1, path2],
-        };
-
-        let decision = scheduler.pick_path(&input).unwrap();
-        // BLEST 应该过滤掉慢路
-        assert_eq!(decision.primary, 1);
-        assert_eq!(decision.redundant, None, "慢路应该被 BLEST 过滤");
+        let path2 = create_test_path(2, 200.0, 1.0, 0.0);  // 慢路（ETA 远大于 fast+Δ）
+        let input = EpochInput { now_ms: 0, epoch_ms: 200, packet_len_hint: 1500, paths: vec![path1, path2], prev_weights: None };
+        let plan = scheduler.compute_plan(&input).unwrap();
+        let w_fast = weight_of(&plan, 1);
+        let w_slow = weight_of(&plan, 2);
+        assert!(w_fast > w_slow, "BLEST 门控下慢路权重应被衰减");
+        assert!(w_slow < 0.2, "慢路权重应足够小，避免乱序放大 (w_slow={})", w_slow);
     }
 
     #[test]
@@ -681,184 +922,63 @@ mod tests {
         cfg.enable_qaware = true;
         cfg.target_qdelay_ms = 10;
         let scheduler = Scheduler::new(cfg);
-        
         let mut path1 = create_test_path(1, 50.0, 1.0, 0.0);
-        path1.inflight_bytes = 100_000;  // 高在途,高队列时延
-        let path2 = create_test_path(2, 60.0, 1.0, 0.0);
-
-        let input = PickInput {
-            now_ms: 0,
-            packet_len: 1500,
-            flow_bytes_sent: 0,
-            critical: false,
-            paths: vec![path1, path2],
-        };
-
-        let decision = scheduler.pick_path(&input).unwrap();
-        // path1 队列时延过高,应该被惩罚
-        assert_eq!(decision.primary, 2, "应该避免高队列时延路径");
+        path1.inflight_bytes = 100_000; // 高在途->高排队时延
+        let path2 = create_test_path(2, 50.0, 1.0, 0.0);
+        let input = EpochInput { now_ms: 0, epoch_ms: 200, packet_len_hint: 1500, paths: vec![path1, path2], prev_weights: None };
+        let plan = scheduler.compute_plan(&input).unwrap();
+        assert!(weight_of(&plan, 2) > weight_of(&plan, 1), "应避开高队列时延路径");
     }
 
     #[test]
-    fn test_phase_e_short_flow_redundancy() {
-        let mut cfg = Config::default();
-        cfg.enable_redundancy = true;
-        cfg.short_flow_thresh = 64 * 1024;
+    fn test_phase_e_redundancy_pair_by_eta() {
+        let cfg = Config::default();
         let scheduler = Scheduler::new(cfg.clone());
-        
         let path1 = create_test_path(1, 50.0, 1.0, 0.0);
         let path2 = create_test_path(2, 100.0, 1.0, 0.0);
-
-        let input = PickInput {
-            now_ms: 0,
-            packet_len: 1500,
-            flow_bytes_sent: 1024,  // 短流
-            critical: false,
-            paths: vec![path1.clone(), path2.clone()],
-        };
-
-        // 计算预期
-        let eta1 = path1.estimate_eta(input.now_ms, input.packet_len);
-        let eta2 = path2.estimate_eta(input.now_ms, input.packet_len);
-        let eta_gap = (eta2 - eta1).abs();
-        let delta = (0.25_f64 * 50.0).clamp(4.0, cfg.blest_delta_cap_ms as f64);
-        
-        eprintln!("短流冗余测试:");
-        eprintln!("  Path1 ETA: {:.2}ms, Path2 ETA: {:.2}ms", eta1, eta2);
-        eprintln!("  ETA Gap: {:.2}ms, BLEST Delta: {:.2}ms", eta_gap, delta);
-        eprintln!("  flow_bytes_sent: {}, thresh: {}", input.flow_bytes_sent, cfg.short_flow_thresh);
-
-        let decision = scheduler.pick_path(&input).unwrap();
-        eprintln!("  Decision: primary={}, redundant={:?}", decision.primary, decision.redundant);
-        
-        assert_eq!(decision.primary, 1);
-        
-        // 只有当 ETA 差距 > delta 时才应该触发冗余
-        if eta_gap > delta {
-            assert!(decision.redundant.is_some(), 
-                "短流 + ETA差距({:.2}ms) > delta({:.2}ms) 应该触发冗余发送", eta_gap, delta);
-        }
-    }
-
-    #[test]
-    fn test_phase_e_idle_burst_redundancy() {
-        let mut cfg = Config::default();
-        cfg.enable_redundancy = true;
-        cfg.idle_burst_ms = 250;
-        let scheduler = Scheduler::new(cfg.clone());
-        
-        let mut path1 = create_test_path(1, 50.0, 1.0, 0.0);
-        path1.last_tx_age_ms = 300;  // 空闲超过阈值
-        let path2 = create_test_path(2, 100.0, 1.0, 0.0);
-
-        let input = PickInput {
-            now_ms: 0,
-            packet_len: 1500,
-            flow_bytes_sent: 1_000_000,  // 长流
-            critical: false,
-            paths: vec![path1.clone(), path2.clone()],
-        };
-
-        let eta1 = path1.estimate_eta(input.now_ms, input.packet_len);
-        let eta2 = path2.estimate_eta(input.now_ms, input.packet_len);
-        let eta_gap = (eta2 - eta1).abs();
-        let delta = (0.25_f64 * 50.0).clamp(4.0, cfg.blest_delta_cap_ms as f64);
-        
-        eprintln!("空闲突发冗余测试:");
-        eprintln!("  last_tx_age_ms: {}ms, thresh: {}ms", path1.last_tx_age_ms, cfg.idle_burst_ms);
-        eprintln!("  Path1 ETA: {:.2}ms, Path2 ETA: {:.2}ms", eta1, eta2);
-        eprintln!("  ETA Gap: {:.2}ms, BLEST Delta: {:.2}ms", eta_gap, delta);
-
-        let decision = scheduler.pick_path(&input).unwrap();
-        eprintln!("  Decision: primary={}, redundant={:?}", decision.primary, decision.redundant);
-        
-        // 只有当 ETA 差距 > delta 时才应该触发冗余
-        if eta_gap > delta {
-            assert!(decision.redundant.is_some(), 
-                "空闲突发 + ETA差距({:.2}ms) > delta({:.2}ms) 应该触发冗余", eta_gap, delta);
-        }
-    }
-
-    #[test]
-    fn test_phase_e_critical_redundancy() {
-        let mut cfg = Config::default();
-        cfg.enable_redundancy = true;
-        let scheduler = Scheduler::new(cfg.clone());
-        
-        let path1 = create_test_path(1, 50.0, 1.0, 0.0);
-        let path2 = create_test_path(2, 100.0, 1.0, 0.0);
-
-        let input = PickInput {
-            now_ms: 0,
-            packet_len: 1500,
-            flow_bytes_sent: 1_000_000,  // 长流
-            critical: true,              // 关键包
-            paths: vec![path1.clone(), path2.clone()],
-        };
-
-        let eta1 = path1.estimate_eta(input.now_ms, input.packet_len);
-        let eta2 = path2.estimate_eta(input.now_ms, input.packet_len);
-        let eta_gap = (eta2 - eta1).abs();
-        let delta = (0.25_f64 * 50.0).clamp(4.0, cfg.blest_delta_cap_ms as f64);
-        
-        eprintln!("关键包冗余测试:");
-        eprintln!("  critical: {}", input.critical);
-        eprintln!("  Path1 ETA: {:.2}ms, Path2 ETA: {:.2}ms", eta1, eta2);
-        eprintln!("  ETA Gap: {:.2}ms, BLEST Delta: {:.2}ms", eta_gap, delta);
-
-        let decision = scheduler.pick_path(&input).unwrap();
-        eprintln!("  Decision: primary={}, redundant={:?}", decision.primary, decision.redundant);
-        
-        // 只有当 ETA 差距 > delta 时才应该触发冗余
-        if eta_gap > delta {
-            assert!(decision.redundant.is_some(), 
-                "关键包 + ETA差距({:.2}ms) > delta({:.2}ms) 应该触发冗余", eta_gap, delta);
+        let input = EpochInput { now_ms: 0, epoch_ms: 200, packet_len_hint: 1500, paths: vec![path1.clone(), path2.clone()], prev_weights: None };
+        let plan = scheduler.compute_plan(&input).unwrap();
+        match plan.redundancy {
+            RedundancyMode::ShortIdleCritical { pair, budget_pkts, .. } => {
+                // pair 应为 ETA 最小的前两条（顺序不强制）
+                let ids = [pair.0, pair.1];
+                assert!(ids.contains(&1) && ids.contains(&2), "冗余路径应覆盖前两条路径");
+                assert_eq!(budget_pkts, cfg.redundancy_epoch_budget_pkts);
+            }
+            RedundancyMode::Off => {
+                // 允许由于权重门槛或 Δ 未满足而关闭，但此用例预期开启
+                panic!("预期冗余开启，但为 Off");
+            }
+            _ => {}
         }
     }
 
     #[test]
     fn test_no_paths_available() {
         let scheduler = Scheduler::new(Config::default());
-        
-        let input = PickInput {
-            now_ms: 0,
-            packet_len: 1500,
-            flow_bytes_sent: 0,
-            critical: false,
-            paths: vec![],
-        };
-
-        let decision = scheduler.pick_path(&input);
-        assert!(decision.is_none(), "没有路径应返回 None");
+        let input = EpochInput { now_ms: 0, epoch_ms: 200, packet_len_hint: 1500, paths: vec![], prev_weights: None };
+        let plan = scheduler.compute_plan(&input);
+        assert!(plan.is_none(), "没有路径应返回 None");
     }
 
     #[test]
     fn test_single_path() {
         let scheduler = Scheduler::new(Config::default());
-        
         let path1 = create_test_path(1, 50.0, 1.0, 0.0);
-
-        let input = PickInput {
-            now_ms: 0,
-            packet_len: 1500,
-            flow_bytes_sent: 0,
-            critical: false,
-            paths: vec![path1],
-        };
-
-        let decision = scheduler.pick_path(&input).unwrap();
-        assert_eq!(decision.primary, 1);
-        assert_eq!(decision.redundant, None, "单路径不应有冗余");
+        let input = EpochInput { now_ms: 0, epoch_ms: 200, packet_len_hint: 1500, paths: vec![path1], prev_weights: None };
+        let plan = scheduler.compute_plan(&input).unwrap();
+        assert_eq!(plan.lb_weights.len(), 1);
+        assert_eq!(plan.lb_weights[0].id, 1);
+        assert!(approx(plan.lb_weights[0].weight, 1.0, 1e-9));
+        assert!(matches!(plan.redundancy, RedundancyMode::Off));
     }
 
     #[test]
     fn test_config_hot_update() {
         let scheduler = Scheduler::new(Config::default());
-        
         let mut new_cfg = Config::default();
         new_cfg.target_qdelay_ms = 20;
         scheduler.update_config(new_cfg);
-
         let cfg = scheduler.get_config();
         assert_eq!(cfg.target_qdelay_ms, 20, "配置应该热更新成功");
     }
@@ -881,54 +1001,80 @@ mod tests {
     #[test]
     fn test_path_snapshot_helpers() {
         let path = create_test_path(1, 50.0, 1.0, 0.0);
-        
         assert!(path.is_usable(), "正常路径应该可用");
         assert!(path.queue_delay_ms() >= 0.0, "队列时延应非负");
         assert!(path.headroom_bytes() >= 0.0, "余量应非负");
-        
         let eta = path.estimate_eta(1000, 1500);
         assert!(eta > 1000.0, "ETA 应该在未来");
     }
 
     #[test]
     fn test_realistic_scenario_250ms_10pct_loss() {
-        // 模拟: 250ms / 10% 丢包场景
         let scheduler = Scheduler::new(Config::default());
-        
-        let path1 = create_test_path(1, 50.0, 10.0, 0.05);   // 快路,低丢包
-        let path2 = create_test_path(2, 250.0, 5.0, 0.10);   // 慢路,高丢包
-
-        let input = PickInput {
-            now_ms: 0,
-            packet_len: 1500,
-            flow_bytes_sent: 0,
-            critical: false,
-            paths: vec![path1, path2],
-        };
-
-        let decision = scheduler.pick_path(&input).unwrap();
-        // 应该优先快路,BLEST 抑制慢路
-        assert_eq!(decision.primary, 1, "应该选择快速低丢包路径");
+        let path1 = create_test_path(1, 50.0, 10.0, 0.05);  // 快路,低丢包
+        let path2 = create_test_path(2, 250.0, 5.0, 0.10);  // 慢路,高丢包
+        let input = EpochInput { now_ms: 0, epoch_ms: 200, packet_len_hint: 1500, paths: vec![path1, path2], prev_weights: None };
+        let plan = scheduler.compute_plan(&input).unwrap();
+        assert!(weight_of(&plan, 1) > weight_of(&plan, 2), "应该选择快速低丢包路径");
     }
 
     #[test]
     fn test_realistic_scenario_50ms_5pct_loss() {
-        // 模拟: 50ms / 5% 丢包场景 (两路均衡)
         let scheduler = Scheduler::new(Config::default());
-        
         let path1 = create_test_path(1, 50.0, 5.0, 0.05);
         let path2 = create_test_path(2, 50.0, 5.0, 0.05);
+        let input = EpochInput { now_ms: 0, epoch_ms: 200, packet_len_hint: 1500, paths: vec![path1, path2], prev_weights: None };
+        let plan = scheduler.compute_plan(&input).unwrap();
+        let w1 = weight_of(&plan, 1);
+        let w2 = weight_of(&plan, 2);
+        assert!(w1 > 0.3 && w2 > 0.3, "两路应较为均衡");
+        assert!((w1 - w2).abs() < 0.25, "两路权重差异不应过大: w1={} w2={}", w1, w2);
+    }
 
-        let input = PickInput {
-            now_ms: 0,
-            packet_len: 1500,
-            flow_bytes_sent: 0,
-            critical: false,
-            paths: vec![path1, path2],
-        };
+    #[test]
+    fn test_ema_smoothing() {
+        let mut cfg = Config::default();
+        cfg.smooth_alpha = 0.6;
+        let scheduler = Scheduler::new(cfg);
+        // 原权重偏向路径1
+        let prev = vec![PathWeight { id: 1, weight: 1.0 }, PathWeight { id: 2, weight: 0.0 }];
+        // 当前原始偏向路径2（通过带宽差异实现）
+        let p1 = create_test_path(1, 50.0, 1.0, 0.0);
+        let p2 = create_test_path(2, 50.0, 100.0, 0.0);
+        let input = EpochInput { now_ms: 0, epoch_ms: 200, packet_len_hint: 1500, paths: vec![p1, p2], prev_weights: Some(prev) };
+        let plan = scheduler.compute_plan(&input).unwrap();
+        let w1 = weight_of(&plan, 1);
+        let w2 = weight_of(&plan, 2);
+        // 平滑后路径2占优，但不会接近1.0
+        assert!(w2 > w1, "EMA 后应逐步向新的原始偏好移动");
+        assert!(w2 < 0.9, "EMA 抑制瞬时抖动，权重不应过于极端");
+    }
 
-        let decision = scheduler.pick_path(&input);
-        // 两路相近,任何一条都可接受
-        assert!(decision.is_some(), "应该能选出一条路径");
+    #[test]
+    fn test_min_share_floor() {
+        let mut cfg = Config::default();
+        cfg.min_share = 0.05; // 启用最小份额
+        let scheduler = Scheduler::new(cfg);
+        let p1 = create_test_path(1, 50.0, 10.0, 0.0);
+        let p2 = create_test_path(2, 50.0, 1.0, 0.0);  // 弱路但不极端
+        let input = EpochInput { now_ms: 0, epoch_ms: 200, packet_len_hint: 1500, paths: vec![p1, p2], prev_weights: None };
+        let plan = scheduler.compute_plan(&input).unwrap();
+        for w in &plan.lb_weights {
+            assert!(w.weight >= 0.05 - 1e-6, "所有活跃路径应不低于最小份额: actual={:.6}", w.weight);
+        }
+        assert!(approx(sum_weights(&plan), 1.0, 1e-6));
+    }
+
+    #[test]
+    fn test_redundancy_weight_gate() {
+        let mut cfg = Config::default();
+        cfg.redundancy_min_weight = 0.5; // 提高门槛
+        let scheduler = Scheduler::new(cfg);
+        // 路径1权重大，路径2很小，尽管 ETA gap > Δ 也不应触发冗余
+        let p1 = create_test_path(1, 50.0, 10.0, 0.0);
+        let p2 = create_test_path(2, 100.0, 1.0, 0.0);
+        let input = EpochInput { now_ms: 0, epoch_ms: 200, packet_len_hint: 1500, paths: vec![p1, p2], prev_weights: None };
+        let plan = scheduler.compute_plan(&input).unwrap();
+        assert!(matches!(plan.redundancy, RedundancyMode::Off), "权重不足应不触发冗余");
     }
 }

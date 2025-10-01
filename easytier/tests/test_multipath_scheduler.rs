@@ -11,7 +11,7 @@ fn create_test_path(id: PathId, srtt_ms: f32, bw_mbps: f64, loss_rate: f32) -> P
         srtt_ms,
         rttvar_ms: srtt_ms * 0.2,
         min_rtt_ms: srtt_ms * 0.8,
-        bw_est_Bps: bw_mbps * 1_000_000.0,
+        bw_est_bps: bw_mbps * 1_000_000.0,
         loss_rate,
         inflight_bytes: 0,
         last_tx_age_ms: 0,
@@ -68,6 +68,7 @@ fn test_idle_burst_redundancy_detailed() {
     cfg.enable_redundancy = true;
     cfg.idle_burst_ms = 250;
     cfg.blest_delta_cap_ms = 25;
+    let idle_threshold = cfg.idle_burst_ms;
     let scheduler = Scheduler::new(cfg);
     
     let mut path1 = create_test_path(1, 50.0, 10.0, 0.0);
@@ -89,14 +90,14 @@ fn test_idle_burst_redundancy_detailed() {
     let delta = 0.25 * 50.0;
     
     println!("Idle burst test:");
-    println!("Path1 last_tx_age: {}ms (threshold: {}ms)", path1.last_tx_age_ms, cfg.idle_burst_ms);
+    println!("Path1 last_tx_age: {}ms (threshold: {}ms)", path1.last_tx_age_ms, idle_threshold);
     println!("ETA gap: {:.2}ms, delta: {:.2}ms", eta_gap, delta);
 
     let decision = scheduler.pick_path(&input).unwrap();
     println!("Decision: primary={}, redundant={:?}", decision.primary, decision.redundant);
     
     // 检查空闲条件是否被正确识别
-    let is_idle = path1.last_tx_age_ms >= cfg.idle_burst_ms;
+    let is_idle = path1.last_tx_age_ms >= idle_threshold;
     assert!(is_idle, "应该识别为空闲突发");
     
     if eta_gap > delta {
@@ -181,6 +182,8 @@ fn test_long_flow_no_redundancy() {
     let mut cfg = Config::default();
     cfg.enable_redundancy = true;
     cfg.short_flow_thresh = 64 * 1024;
+    let short_thresh = cfg.short_flow_thresh;
+    let idle_thresh = cfg.idle_burst_ms;
     let scheduler = Scheduler::new(cfg);
     
     let path1 = create_test_path(1, 50.0, 10.0, 0.0);
@@ -195,8 +198,8 @@ fn test_long_flow_no_redundancy() {
     };
 
     // 检查没有任何冗余触发条件
-    let is_short = input.flow_bytes_sent <= cfg.short_flow_thresh;
-    let is_idle = input.paths.iter().any(|p| p.last_tx_age_ms >= cfg.idle_burst_ms);
+    let is_short = input.flow_bytes_sent <= short_thresh;
+    let is_idle = input.paths.iter().any(|p| p.last_tx_age_ms >= idle_thresh);
     
     println!("Long flow test:");
     println!("is_short: {}, is_idle: {}, critical: {}", is_short, is_idle, input.critical);
